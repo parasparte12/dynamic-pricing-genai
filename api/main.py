@@ -41,3 +41,45 @@ def predict_price(ride: CabRideInput):
         "price_range_low": round(float(lower_price), 2),
         "price_range_high": round(float(upper_price), 2)
     }
+
+class WhatIfInput(BaseModel):
+    distance: float
+    surge_multiplier: float
+    hour_of_day: int
+    day_of_week: int
+    is_weekend: int
+    is_rush_hour: int
+    is_raining: int
+    cab_type_encoded: int
+    name_encoded: int
+    proposed_price: float
+
+@app.post("/whatif")
+def what_if_price_change(ride: WhatIfInput):
+    ride_dict = ride.dict()
+    proposed_price = ride_dict.pop('proposed_price')
+
+    input_df = pd.DataFrame([ride_dict])[cab_feature_cols]
+
+    model_price = cab_model.predict(input_df)[0]
+    lower_bound = cab_model_lower.predict(input_df)[0]
+    upper_bound = cab_model_upper.predict(input_df)[0]
+
+    if proposed_price < lower_bound:
+        verdict = "below_expected_range"
+        message = f"The proposed price (${proposed_price:.2f}) is below what conditions typically justify (${lower_bound:.2f}-${upper_bound:.2f}). This may undervalue the ride."
+    elif proposed_price > upper_bound:
+        verdict = "above_expected_range"
+        message = f"The proposed price (${proposed_price:.2f}) is above what conditions typically justify (${lower_bound:.2f}-${upper_bound:.2f}). This may be overpriced relative to demand and distance."
+    else:
+        verdict = "within_expected_range"
+        message = f"The proposed price (${proposed_price:.2f}) is within the model's expected range (${lower_bound:.2f}-${upper_bound:.2f}) for these conditions."
+
+    return {
+        "proposed_price": round(proposed_price, 2),
+        "model_expected_price": round(float(model_price), 2),
+        "expected_range_low": round(float(lower_bound), 2),
+        "expected_range_high": round(float(upper_bound), 2),
+        "verdict": verdict,
+        "message": message
+    }

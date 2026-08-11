@@ -83,3 +83,34 @@ def what_if_price_change(ride: WhatIfInput):
         "verdict": verdict,
         "message": message
     }
+
+# Load flights model artifacts
+flights_model = joblib.load('../model/flights_price_model.pkl')
+flights_model_lower = joblib.load('../model/flights_price_model_lower.pkl')
+flights_model_upper = joblib.load('../model/flights_price_model_upper.pkl')
+flights_feature_cols = joblib.load('../model/flights_feature_cols.pkl')
+
+class FlightInput(BaseModel):
+    airline_encoded: int
+    source_city_encoded: int
+    departure_time_encoded: int
+    stops_encoded: int
+    arrival_time_encoded: int
+    destination_city_encoded: int
+    class_encoded: int
+    duration: float
+    days_left: int
+
+@app.post("/predict_flight")
+def predict_flight_price(flight: FlightInput):
+    input_df = pd.DataFrame([flight.dict()])[flights_feature_cols]
+
+    point_price = flights_model.predict(input_df)[0]
+    lower_price = flights_model_lower.predict(input_df)[0]
+    upper_price = flights_model_upper.predict(input_df)[0]
+
+    return {
+        "predicted_price": round(float(point_price), 2),
+        "price_range_low": round(float(lower_price), 2),
+        "price_range_high": round(float(upper_price), 2)
+    }

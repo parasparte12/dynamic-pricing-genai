@@ -67,13 +67,13 @@ def what_if_price_change(ride: WhatIfInput):
 
     if proposed_price < lower_bound:
         verdict = "below_expected_range"
-        message = f"The proposed price (${proposed_price:.2f}) is below what conditions typically justify (${lower_bound:.2f}-${upper_bound:.2f}). This may undervalue the ride."
+        message = f"The proposed price (\\${proposed_price:.2f}) is below what conditions typically justify (\\${lower_bound:.2f}-\\${upper_bound:.2f}). This may undervalue the ride."
     elif proposed_price > upper_bound:
         verdict = "above_expected_range"
-        message = f"The proposed price (${proposed_price:.2f}) is above what conditions typically justify (${lower_bound:.2f}-${upper_bound:.2f}). This may be overpriced relative to demand and distance."
+        message = f"The proposed price (\\${proposed_price:.2f}) is above what conditions typically justify (\\${lower_bound:.2f}-\\${upper_bound:.2f}). This may be overpriced relative to demand and distance."
     else:
         verdict = "within_expected_range"
-        message = f"The proposed price (${proposed_price:.2f}) is within the model's expected range (${lower_bound:.2f}-${upper_bound:.2f}) for these conditions."
+        message = f"The proposed price (\\${proposed_price:.2f}) is within the model's expected range (\\${lower_bound:.2f}-\\${upper_bound:.2f}) for these conditions."
 
     return {
         "proposed_price": round(proposed_price, 2),

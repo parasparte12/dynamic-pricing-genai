@@ -22,7 +22,7 @@ MODEL_DIR = BASE_DIR / "model"
 # Load SHAP explainer and feature columns
 try:
     shap_explainer = joblib.load(MODEL_DIR / "cab_shap_explainer.pkl")
-    feature_cols = joblib.load(MODEL_DIR / "feature_cols.pkl")
+    feature_cols = joblib.load(MODEL_DIR / "cab_feature_cols.pkl")
     model = joblib.load(MODEL_DIR / "cab_price_model.pkl")
     st.session_state.shap_loaded = True
 except Exception as e:
@@ -78,16 +78,21 @@ with tab1:
             input_df = pd.DataFrame([payload])
             
             # Get SHAP values for this prediction
-            shap_values = shap_explainer.shap_values(input_df)
+            raw_shap_values = shap_explainer.shap_values(input_df)
+            if isinstance(raw_shap_values, list):
+                shap_values = raw_shap_values[0]
+            else:
+                shap_values = raw_shap_values
+            shap_values = np.asarray(shap_values).reshape(-1)
             
             # Display prediction
             col_pred1, col_pred2, col_pred3 = st.columns(3)
             with col_pred1:
-                st.metric("Predicted Price", f"${prediction.get('predicted_price', 'N/A'):.2f}")
+                st.metric("Predicted Price", f"${float(prediction.get('predicted_price', 0)):.2f}")
             with col_pred2:
-                st.metric("Price Range Low", f"${prediction.get('price_range_low', 'N/A'):.2f}")
+                st.metric("Price Range Low", f"${float(prediction.get('price_range_low', 0)):.2f}")
             with col_pred3:
-                st.metric("Price Range High", f"${prediction.get('price_range_high', 'N/A'):.2f}")
+                st.metric("Price Range High", f"${float(prediction.get('price_range_high', 0)):.2f}")
             
             # Display SHAP values as feature importance
             st.subheader("Feature Contributions to Price")
@@ -95,7 +100,7 @@ with tab1:
             # Create SHAP feature importance bar chart
             feature_importance = pd.DataFrame({
                 'Feature': feature_cols,
-                'SHAP Value': np.abs(shap_values[0])
+                'SHAP Value': np.abs(shap_values)
             }).sort_values('SHAP Value', ascending=False)
             
             fig = px.bar(feature_importance, 
@@ -112,9 +117,12 @@ with tab1:
             impact_df = pd.DataFrame({
                 'Feature': feature_cols,
                 'Value': input_df.iloc[0].values,
-                'SHAP Value': shap_values[0],
-                'Impact': ['↑ Increases Price' if v > 0 else '↓ Decreases Price' for v in shap_values[0]]
-            }).sort_values('SHAP Value', key=abs, ascending=False)
+                'SHAP Value': shap_values,
+                'Impact': ['↑ Increases Price' if v > 0 else '↓ Decreases Price' for v in shap_values]
+            })
+            impact_df['abs_shap'] = impact_df['SHAP Value'].abs()
+            impact_df = impact_df.sort_values('abs_shap', ascending=False)
+            impact_df = impact_df.drop(columns=['abs_shap'])
             
             st.dataframe(impact_df, use_container_width=True)
             

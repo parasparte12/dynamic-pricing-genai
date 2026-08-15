@@ -1,16 +1,23 @@
+from pathlib import Path
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 import joblib
 import pandas as pd
 
+from api.db import log_prediction
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+MODEL_DIR = BASE_DIR / 'model'
+
 app = FastAPI(title="Dynamic Pricing Engine API")
 
 # Load all cab model artifacts once, when the server starts
-cab_model = joblib.load('../model/cab_price_model.pkl')
-cab_model_lower = joblib.load('../model/cab_price_model_lower.pkl')
-cab_model_upper = joblib.load('../model/cab_price_model_upper.pkl')
-cab_explainer = joblib.load('../model/cab_shap_explainer.pkl')
-cab_feature_cols = joblib.load('../model/cab_feature_cols.pkl')
+cab_model = joblib.load(MODEL_DIR / 'cab_price_model.pkl')
+cab_model_lower = joblib.load(MODEL_DIR / 'cab_price_model_lower.pkl')
+cab_model_upper = joblib.load(MODEL_DIR / 'cab_price_model_upper.pkl')
+cab_explainer = joblib.load(MODEL_DIR / 'cab_shap_explainer.pkl')
+cab_feature_cols = joblib.load(MODEL_DIR / 'cab_feature_cols.pkl')
 
 # Define the shape of a valid request
 class CabRideInput(BaseModel):
@@ -30,17 +37,32 @@ def root():
 
 @app.post("/predict")
 def predict_price(ride: CabRideInput):
-    input_df = pd.DataFrame([ride.dict()])[cab_feature_cols]
+    input_payload = ride.dict()
+    input_df = pd.DataFrame([input_payload])[cab_feature_cols]
 
     point_price = cab_model.predict(input_df)[0]
     lower_price = cab_model_lower.predict(input_df)[0]
     upper_price = cab_model_upper.predict(input_df)[0]
 
-    return {
+    response = {
         "predicted_price": round(float(point_price), 2),
         "price_range_low": round(float(lower_price), 2),
         "price_range_high": round(float(upper_price), 2)
     }
+
+    try:
+        log_prediction(
+            endpoint="predict",
+            input_json=input_payload,
+            prediction=response["predicted_price"],
+            lower_bound=response["price_range_low"],
+            upper_bound=response["price_range_high"],
+            model_version="cab_v1",
+        )
+    except Exception:
+        pass
+
+    return response
 
 class WhatIfInput(BaseModel):
     distance: float
@@ -75,7 +97,7 @@ def what_if_price_change(ride: WhatIfInput):
         verdict = "within_expected_range"
         message = f"The proposed price (\\${proposed_price:.2f}) is within the model's expected range (\\${lower_bound:.2f}-\\${upper_bound:.2f}) for these conditions."
 
-    return {
+    response = {
         "proposed_price": round(proposed_price, 2),
         "model_expected_price": round(float(model_price), 2),
         "expected_range_low": round(float(lower_bound), 2),
@@ -84,11 +106,25 @@ def what_if_price_change(ride: WhatIfInput):
         "message": message
     }
 
+    try:
+        log_prediction(
+            endpoint="whatif",
+            input_json=ride_dict,
+            prediction=response["model_expected_price"],
+            lower_bound=response["expected_range_low"],
+            upper_bound=response["expected_range_high"],
+            model_version="cab_v1",
+        )
+    except Exception:
+        pass
+
+    return response
+
 # Load flights model artifacts
-flights_model = joblib.load('../model/flights_price_model.pkl')
-flights_model_lower = joblib.load('../model/flights_price_model_lower.pkl')
-flights_model_upper = joblib.load('../model/flights_price_model_upper.pkl')
-flights_feature_cols = joblib.load('../model/flights_feature_cols.pkl')
+flights_model = joblib.load(MODEL_DIR / 'flights_price_model.pkl')
+flights_model_lower = joblib.load(MODEL_DIR / 'flights_price_model_lower.pkl')
+flights_model_upper = joblib.load(MODEL_DIR / 'flights_price_model_upper.pkl')
+flights_feature_cols = joblib.load(MODEL_DIR / 'flights_feature_cols.pkl')
 
 class FlightInput(BaseModel):
     airline_encoded: int
@@ -103,14 +139,29 @@ class FlightInput(BaseModel):
 
 @app.post("/predict_flight")
 def predict_flight_price(flight: FlightInput):
-    input_df = pd.DataFrame([flight.dict()])[flights_feature_cols]
+    input_payload = flight.dict()
+    input_df = pd.DataFrame([input_payload])[flights_feature_cols]
 
     point_price = flights_model.predict(input_df)[0]
     lower_price = flights_model_lower.predict(input_df)[0]
     upper_price = flights_model_upper.predict(input_df)[0]
 
-    return {
+    response = {
         "predicted_price": round(float(point_price), 2),
         "price_range_low": round(float(lower_price), 2),
         "price_range_high": round(float(upper_price), 2)
     }
+
+    try:
+        log_prediction(
+            endpoint="predict_flight",
+            input_json=input_payload,
+            prediction=response["predicted_price"],
+            lower_bound=response["price_range_low"],
+            upper_bound=response["price_range_high"],
+            model_version="flights_v1",
+        )
+    except Exception:
+        pass
+
+    return response

@@ -1,29 +1,23 @@
 import streamlit as st
 import requests
-import joblib
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import plotly.express as px
-from pathlib import Path
 
 st.set_page_config(page_title="SHAP Explanations", page_icon="📊", layout="wide")
 
 st.title("📊 SHAP Feature Importance")
 st.markdown("""
-Understand which factors most impact your price predictions. 
+Understand which factors most impact your price predictions.
 These SHAP explanations show feature importance for individual predictions.
 """)
 
-# Initialize paths
-BASE_DIR = Path(__file__).parent.parent.parent
-MODEL_DIR = BASE_DIR / "model"
-
-# Load SHAP explainer and feature columns
+# SHAP computation is sourced from the authoritative pricing service (same
+# explainer, same model, same input construction) instead of loading a
+# separate copy of the model artifacts on this page.
 try:
-    shap_explainer = joblib.load(MODEL_DIR / "cab_shap_explainer.pkl")
-    feature_cols = joblib.load(MODEL_DIR / "cab_feature_cols.pkl")
-    model = joblib.load(MODEL_DIR / "cab_price_model.pkl")
+    from api.pricing_service import explain_cab_price
     st.session_state.shap_loaded = True
 except Exception as e:
     st.error(f"❌ Could not load SHAP explainer: {e}")
@@ -74,16 +68,11 @@ with tab1:
             response.raise_for_status()
             prediction = response.json()
             
-            # Create input dataframe in the same format as training data
-            input_df = pd.DataFrame([payload])
-            
-            # Get SHAP values for this prediction
-            raw_shap_values = shap_explainer.shap_values(input_df)
-            if isinstance(raw_shap_values, list):
-                shap_values = raw_shap_values[0]
-            else:
-                shap_values = raw_shap_values
-            shap_values = np.asarray(shap_values).reshape(-1)
+            # Get SHAP values for this prediction from the authoritative service
+            shap_result = explain_cab_price(payload)
+            feature_names = shap_result["feature_names"]
+            feature_values = shap_result["feature_values"]
+            shap_values = np.array(shap_result["shap_values"])
             
             # Display prediction
             col_pred1, col_pred2, col_pred3 = st.columns(3)
@@ -99,7 +88,7 @@ with tab1:
             
             # Create SHAP feature importance bar chart
             feature_importance = pd.DataFrame({
-                'Feature': feature_cols,
+                'Feature': feature_names,
                 'SHAP Value': np.abs(shap_values)
             }).sort_values('SHAP Value', ascending=False)
             
@@ -115,8 +104,8 @@ with tab1:
             # Show actual SHAP values (with sign indicating increase/decrease in price)
             st.subheader("Feature Impact Direction")
             impact_df = pd.DataFrame({
-                'Feature': feature_cols,
-                'Value': input_df.iloc[0].values,
+                'Feature': feature_names,
+                'Value': feature_values,
                 'SHAP Value': shap_values,
                 'Impact': ['↑ Increases Price' if v > 0 else '↓ Decreases Price' for v in shap_values]
             })

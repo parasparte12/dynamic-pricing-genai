@@ -1,23 +1,14 @@
-from pathlib import Path
-
 from fastapi import FastAPI
 from pydantic import BaseModel
-import joblib
-import pandas as pd
 
 from api.db import log_prediction
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-MODEL_DIR = BASE_DIR / 'model'
+from api.pricing_service import (
+    predict_cab_price as compute_cab_price,
+    predict_cab_price_raw,
+    predict_flight_price as compute_flight_price,
+)
 
 app = FastAPI(title="Dynamic Pricing Engine API")
-
-# Load all cab model artifacts once, when the server starts
-cab_model = joblib.load(MODEL_DIR / 'cab_price_model.pkl')
-cab_model_lower = joblib.load(MODEL_DIR / 'cab_price_model_lower.pkl')
-cab_model_upper = joblib.load(MODEL_DIR / 'cab_price_model_upper.pkl')
-cab_explainer = joblib.load(MODEL_DIR / 'cab_shap_explainer.pkl')
-cab_feature_cols = joblib.load(MODEL_DIR / 'cab_feature_cols.pkl')
 
 # Define the shape of a valid request
 class CabRideInput(BaseModel):
@@ -38,17 +29,7 @@ def root():
 @app.post("/predict")
 def predict_price(ride: CabRideInput):
     input_payload = ride.dict()
-    input_df = pd.DataFrame([input_payload])[cab_feature_cols]
-
-    point_price = cab_model.predict(input_df)[0]
-    lower_price = cab_model_lower.predict(input_df)[0]
-    upper_price = cab_model_upper.predict(input_df)[0]
-
-    response = {
-        "predicted_price": round(float(point_price), 2),
-        "price_range_low": round(float(lower_price), 2),
-        "price_range_high": round(float(upper_price), 2)
-    }
+    response = compute_cab_price(input_payload)
 
     try:
         log_prediction(
@@ -81,11 +62,7 @@ def what_if_price_change(ride: WhatIfInput):
     ride_dict = ride.dict()
     proposed_price = ride_dict.pop('proposed_price')
 
-    input_df = pd.DataFrame([ride_dict])[cab_feature_cols]
-
-    model_price = cab_model.predict(input_df)[0]
-    lower_bound = cab_model_lower.predict(input_df)[0]
-    upper_bound = cab_model_upper.predict(input_df)[0]
+    model_price, lower_bound, upper_bound = predict_cab_price_raw(ride_dict)
 
     if proposed_price < lower_bound:
         verdict = "below_expected_range"
@@ -120,12 +97,6 @@ def what_if_price_change(ride: WhatIfInput):
 
     return response
 
-# Load flights model artifacts
-flights_model = joblib.load(MODEL_DIR / 'flights_price_model.pkl')
-flights_model_lower = joblib.load(MODEL_DIR / 'flights_price_model_lower.pkl')
-flights_model_upper = joblib.load(MODEL_DIR / 'flights_price_model_upper.pkl')
-flights_feature_cols = joblib.load(MODEL_DIR / 'flights_feature_cols.pkl')
-
 class FlightInput(BaseModel):
     airline_encoded: int
     source_city_encoded: int
@@ -140,17 +111,7 @@ class FlightInput(BaseModel):
 @app.post("/predict_flight")
 def predict_flight_price(flight: FlightInput):
     input_payload = flight.dict()
-    input_df = pd.DataFrame([input_payload])[flights_feature_cols]
-
-    point_price = flights_model.predict(input_df)[0]
-    lower_price = flights_model_lower.predict(input_df)[0]
-    upper_price = flights_model_upper.predict(input_df)[0]
-
-    response = {
-        "predicted_price": round(float(point_price), 2),
-        "price_range_low": round(float(lower_price), 2),
-        "price_range_high": round(float(upper_price), 2)
-    }
+    response = compute_flight_price(input_payload)
 
     try:
         log_prediction(

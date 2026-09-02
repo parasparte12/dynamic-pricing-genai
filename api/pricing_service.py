@@ -69,8 +69,31 @@ def predict_flight_price(payload: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
+def _extract_expected_value(explainer) -> float:
+    """The explainer's baseline/expected output, as a single float.
+
+    SHAP's TreeExplainer.expected_value is sometimes an array (one entry
+    per model output) even for a single-output regressor; this takes the
+    one relevant scalar rather than guessing or defaulting to zero.
+    """
+    expected_value = getattr(explainer, "expected_value", None)
+    if expected_value is None:
+        raise ValueError("SHAP explainer does not expose an expected_value (baseline).")
+    if isinstance(expected_value, (list, tuple, np.ndarray)):
+        expected_value = np.asarray(expected_value).reshape(-1)[0]
+    return float(expected_value)
+
+
 def explain_cab_price(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """SHAP feature contributions for a single cab prediction."""
+    """SHAP feature contributions for a single cab prediction.
+
+    shap_values are in the same units as predicted_price (dollars), not a
+    proportion or a log-space value: base_value + sum(shap_values)
+    reconstructs the cab model's raw (unrounded) predicted price for this
+    input, to within float32 precision. These are per-instance
+    contributions for THIS prediction -- not global feature importance,
+    and must not be described as such downstream.
+    """
     input_df = prepare_cab_features(payload)
 
     raw_shap_values = cab_explainer.shap_values(input_df)
@@ -84,6 +107,7 @@ def explain_cab_price(payload: Dict[str, Any]) -> Dict[str, Any]:
         "feature_names": feature_names,
         "feature_values": feature_values,
         "shap_values": [float(v) for v in shap_values],
+        "base_value": _extract_expected_value(cab_explainer),
     }
 
 
@@ -106,9 +130,17 @@ class RouteInfo(BaseModel):
 
 
 class ShapContribution(BaseModel):
+    """Per-instance SHAP contributions for one prediction.
+
+    This is NOT global feature importance -- it explains this specific
+    prediction only. shap_values are in the same units as predicted_price
+    (dollars): base_value + sum(shap_values) reconstructs the model's raw
+    predicted price for this input, to within float32 precision.
+    """
     feature_names: List[str]
     feature_values: List[float]
     shap_values: List[float]
+    base_value: float
 
 
 class ModelMetadata(BaseModel):
@@ -154,8 +186,12 @@ def build_cab_pricing_result(
         )
 
     shap_result: Optional[ShapContribution] = None
+    shap_error: Optional[str] = None
     if include_shap:
-        shap_result = ShapContribution(**explain_cab_price(payload))
+        try:
+            shap_result = ShapContribution(**explain_cab_price(payload))
+        except Exception as exc:
+            shap_error = f"SHAP computation failed: {exc}"
 
     return PricingResult(
         success=True,
@@ -167,11 +203,19 @@ def build_cab_pricing_result(
         model_metadata=metadata,
         route=route,
         shap=shap_result,
+        error=shap_error,
     )
 
 
 def build_flight_pricing_result(payload: Dict[str, Any]) -> PricingResult:
-    """Assemble a PricingResult for a flight prediction from real service output."""
+    """Assemble a PricingResult for a flight prediction from real service output.
+
+    No SHAP explainer is currently loaded or wired for the flight model in
+    this service (flights_shap_explainer.pkl exists on disk but nothing in
+    the codebase loads or exposes it today), so the result's `shap` field
+    is always None here. This is a real limitation, not an omission to be
+    silently worked around -- flight SHAP values must not be fabricated.
+    """
     metadata = ModelMetadata(domain="flights", model_version="flights_v1", feature_cols=list(flights_feature_cols))
 
     try:
@@ -197,3 +241,19 @@ def build_flight_pricing_result(payload: Dict[str, Any]) -> PricingResult:
         input_features=payload,
         model_metadata=metadata,
     )
+
+
+def top_shap_contributions(shap: ShapContribution, top_n: int = 5) -> List[Dict[str, Any]]:
+    """Rank this prediction's SHAP contributions by absolute impact.
+
+    Ranks by |shap_value| (so a large negative contribution ranks ahead of
+    a small positive one) while preserving the original signed value. This
+    ranks per-instance contributions for ONE prediction -- it is not
+    global feature importance and must not be presented as such.
+    """
+    contributions = list(zip(shap.feature_names, shap.feature_values, shap.shap_values))
+    contributions.sort(key=lambda item: abs(item[2]), reverse=True)
+    return [
+        {"feature": name, "feature_value": value, "shap_value": contribution}
+        for name, value, contribution in contributions[:top_n]
+    ]

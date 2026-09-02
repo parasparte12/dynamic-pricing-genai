@@ -8,6 +8,7 @@ feature frames independently, so there is exactly one place that turns
 raw inputs into a price.
 """
 
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -257,3 +258,189 @@ def top_shap_contributions(shap: ShapContribution, top_n: int = 5) -> List[Dict[
         {"feature": name, "feature_value": value, "shap_value": contribution}
         for name, value, contribution in contributions[:top_n]
     ]
+
+
+# ---------------------------------------------------------------------------
+# Condition recomputation ("what happens if an input changes?").
+#
+# This is a distinct capability from the existing /whatif proposed-price
+# validation ("is this price reasonable?") -- that endpoint is untouched.
+# recompute_cab_price runs the real model twice (original input, then a
+# modified copy of it) and lets application code -- never an LLM -- compute
+# the difference and percentage change.
+# ---------------------------------------------------------------------------
+
+class RecomputeError(Exception):
+    """Raised for any invalid request to recompute_cab_price.
+
+    `code` is one of: "unsupported_feature", "invalid_type", "invalid_value",
+    "invalid_modification". Callers should catch this and surface `.code`
+    and the message rather than letting it propagate as a generic error.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+# The ONLY features that exist in the cab model's actual input pipeline.
+# There is no "demand" feature -- demand-driven pricing is represented by
+# surge_multiplier, but that mapping is not applied automatically here;
+# a request to modify "demand" is rejected as unsupported (see
+# recompute_cab_price), not silently redirected.
+_CAB_FEATURE_KINDS: Dict[str, str] = {
+    "distance": "float",
+    "surge_multiplier": "float",
+    "hour_of_day": "int",
+    "day_of_week": "int",
+    "is_weekend": "int",
+    "is_rush_hour": "int",
+    "is_raining": "int",
+    "cab_type_encoded": "int",
+    "name_encoded": "int",
+}
+
+_CAB_FEATURE_RANGES: Dict[str, Tuple[Optional[float], Optional[float]]] = {
+    "distance": (0.0, None),
+    "surge_multiplier": (0.0, None),
+    "hour_of_day": (0, 23),
+    "day_of_week": (0, 6),
+    "is_weekend": (0, 1),
+    "is_rush_hour": (0, 1),
+    "is_raining": (0, 1),
+    "cab_type_encoded": (0, None),
+    "name_encoded": (0, None),
+}
+
+
+def _resolve_modification(feature: str, original_value: Any, modification: Any) -> Any:
+    """Turn one requested modification into a concrete candidate value.
+
+    `modification` is either a plain absolute value, or
+    {"percent_change": X} meaning "scale this feature's original value by
+    X percent" (X may be negative). All arithmetic happens here, in
+    application code -- this is what lets a caller express "what if
+    surge_multiplier increases by 20%" without doing that math itself.
+    """
+    if isinstance(modification, dict):
+        if set(modification.keys()) == {"percent_change"}:
+            percent = modification["percent_change"]
+            if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+                raise RecomputeError("invalid_modification", f"percent_change for '{feature}' must be a number.")
+            if not math.isfinite(percent):
+                raise RecomputeError("invalid_modification", f"percent_change for '{feature}' must be finite.")
+            if isinstance(original_value, bool) or not isinstance(original_value, (int, float)):
+                raise RecomputeError("invalid_modification", f"'{feature}' is not numeric; percent_change does not apply.")
+            return original_value * (1 + percent / 100.0)
+        raise RecomputeError(
+            "invalid_modification",
+            f"Unrecognized modification format for '{feature}'. "
+            f"Use an absolute value, or {{'percent_change': X}}.",
+        )
+    return modification
+
+
+def _validate_cab_feature_value(feature: str, value: Any) -> float:
+    """Validate and coerce one candidate cab feature value. Raises RecomputeError."""
+    if isinstance(value, bool):
+        value = int(value)
+    if not isinstance(value, (int, float)):
+        raise RecomputeError("invalid_type", f"'{feature}' must be a number, got {type(value).__name__}.")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise RecomputeError("invalid_value", f"'{feature}' must be a finite number.")
+
+    if _CAB_FEATURE_KINDS[feature] == "int" and float(value) != int(value):
+        raise RecomputeError("invalid_value", f"'{feature}' must be a whole number, got {value}.")
+
+    low, high = _CAB_FEATURE_RANGES[feature]
+    if low is not None and value < low:
+        raise RecomputeError("invalid_value", f"'{feature}' must be >= {low}, got {value}.")
+    if high is not None and value > high:
+        raise RecomputeError("invalid_value", f"'{feature}' must be <= {high}, got {value}.")
+
+    return float(value)
+
+
+class RecomputeResult(BaseModel):
+    success: bool
+    original: Optional[PricingResult] = None
+    new: Optional[PricingResult] = None
+    difference: Optional[float] = None
+    percentage_change: Optional[float] = None
+    modifications: Optional[Dict[str, Dict[str, float]]] = None
+    error: Optional[str] = None
+    message: Optional[str] = None
+
+
+def recompute_cab_price(
+    original_input: Dict[str, Any],
+    modifications: Dict[str, Any],
+    include_shap: bool = False,
+) -> RecomputeResult:
+    """Recompute a cab price after modifying one or more supported inputs.
+
+    `original_input` must be a complete, valid cab feature payload (the
+    same shape /predict accepts). `modifications` maps a feature name --
+    which MUST be one of api.pricing_service.cab_feature_cols, the real
+    model inputs -- to either an absolute new value or
+    {"percent_change": X}. Unsupported feature names (including "demand",
+    which does not exist in this model) are rejected, not silently
+    substituted.
+
+    difference and percentage_change are calculated here from the raw,
+    unrounded model output of predict_cab_price_raw (called on the
+    original and modified inputs) -- never from the already-rounded
+    display prices, and never by an LLM. original/new additionally carry
+    the full rounded PricingResult (including price range and, if
+    include_shap, real SHAP data) via build_cab_pricing_result, reusing
+    that function rather than re-deriving predictions a second way.
+
+    Never raises for a malformed request: validation failures come back
+    as RecomputeResult(success=False, error=..., message=...).
+    """
+    try:
+        original_point_raw, _, _ = predict_cab_price_raw(original_input)
+    except Exception as exc:
+        return RecomputeResult(success=False, error="invalid_original_input", message=str(exc))
+
+    if not modifications:
+        return RecomputeResult(success=False, error="no_modifications", message="No modifications were provided to recompute.")
+
+    modified_input = dict(original_input)
+    applied: Dict[str, Dict[str, float]] = {}
+
+    try:
+        for feature, requested in modifications.items():
+            if feature not in cab_feature_cols:
+                raise RecomputeError(
+                    "unsupported_feature",
+                    f"The current cab model does not support modification of '{feature}'. "
+                    f"Supported features: {', '.join(cab_feature_cols)}.",
+                )
+            original_value = original_input[feature]
+            candidate = _resolve_modification(feature, original_value, requested)
+            validated = _validate_cab_feature_value(feature, candidate)
+            modified_input[feature] = validated
+            applied[feature] = {
+                "original_value": float(original_value),
+                "new_value": validated,
+            }
+    except RecomputeError as exc:
+        return RecomputeResult(success=False, error=exc.code, message=str(exc))
+
+    try:
+        new_point_raw, _, _ = predict_cab_price_raw(modified_input)
+    except Exception as exc:
+        return RecomputeResult(success=False, error="prediction_failed", message=str(exc))
+
+    difference = new_point_raw - original_point_raw
+    percentage_change = (difference / original_point_raw * 100.0) if original_point_raw != 0 else None
+
+    return RecomputeResult(
+        success=True,
+        original=build_cab_pricing_result(original_input, include_shap=include_shap),
+        new=build_cab_pricing_result(modified_input, include_shap=include_shap),
+        difference=round(difference, 2),
+        percentage_change=round(percentage_change, 2) if percentage_change is not None else None,
+        modifications=applied,
+    )

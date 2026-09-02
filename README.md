@@ -20,8 +20,9 @@ A machine learning-powered dynamic pricing system for ride-hailing and flights w
 4. [Data & Models](#data--models)
 5. [API Endpoints](#api-endpoints)
 6. [Frontend Pages](#frontend-pages)
-7. [Configuration](#configuration)
-8. [Troubleshooting](#troubleshooting)
+7. [Route-Based Distance (OpenStreetMap / OSRM)](#route-based-distance-openstreetmap--osrm)
+8. [Configuration](#configuration)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -350,6 +351,12 @@ Predict the fair price for a cab ride given specific conditions.
 3. Set Hour = 8 (morning rush)
 4. Click Predict → See estimated $75-95 price range
 
+**Route-based mode:** instead of dragging the distance slider, switch the
+"How should distance be determined?" toggle to *Route-based*, enter a
+pickup and destination, and click **Calculate Route & Predict Price**. See
+[Route-Based Distance](#route-based-distance-openstreetmap--osrm) below for
+how this works.
+
 ### 2️⃣ What-If Simulator (`2_What_If_Simulator.py`)
 
 Test whether a proposed price is reasonable for given market conditions.
@@ -412,6 +419,97 @@ View historical predictions, trends, and model performance.
 - Download historical data as CSV
 - Identify pricing trends and patterns
 - Track model stability over time
+
+---
+
+## Route-Based Distance (OpenStreetMap / OSRM)
+
+The Price Prediction page can derive the cab ride's `distance` input from a
+real road route instead of a manual slider. This is a **data-acquisition
+layer only** — it does not price rides itself. It resolves two place names
+to a road route and distance, which is then fed into the exact same
+feature-engineering and XGBoost pricing pipeline used by manual input. The
+model remains the sole pricing authority; nothing about the pricing logic
+changed.
+
+```
+Pickup + Destination text
+        ↓
+Nominatim (geocoding → lat/lon)
+        ↓
+OSRM (road route → distance, duration, geometry)
+        ↓
+distance_miles → CabRideInput.distance
+        ↓
+Existing feature engineering → XGBoost cab model → predicted price
+```
+
+### Why not Google Maps
+
+This project uses a fully open-source mapping stack instead of the Google
+Maps Platform, which requires a billing-enabled API key even for its free
+tier. The open-source equivalents need no API key or account:
+
+| Purpose | Service used |
+|---|---|
+| Map tiles | [OpenStreetMap](https://www.openstreetmap.org/) |
+| Geocoding (place name → coordinates) | [Nominatim](https://nominatim.org/) |
+| Road routing (coordinates → route/distance/duration) | [OSRM](http://project-osrm.org/) (public demo server) |
+| In-app map rendering | [pydeck](https://deckgl.readthedocs.io/) via `st.pydeck_chart` (already a project dependency, no new package required) |
+
+### Implementation
+
+- `app/route_service.py` is the isolated route module. It exposes
+  `get_route_for_locations(origin_text, destination_text)`, which geocodes
+  both locations via Nominatim, requests a driving route from OSRM
+  (`geometries=geojson` so the actual road-following polyline is returned,
+  not a straight line), and returns a `RouteResult` with distance (km and
+  miles), duration (minutes), coordinates, and the route geometry.
+- Failures (location not found, no route available, network error, timeout,
+  malformed response) raise a single `RouteError` with a `.kind` and a
+  human-readable message; the Streamlit page catches this and shows
+  `st.error()` instead of crashing.
+- A simple in-process cache avoids re-geocoding or re-routing the same
+  inputs twice in a session, and Nominatim calls are throttled to at most
+  1/second with an identifying `User-Agent`, per Nominatim's usage policy.
+
+### Distance unit and model compatibility
+
+The cab model's `distance` feature was trained on trip distances in **miles**
+(the existing manual slider caps at 10 miles, matching the training data's
+short in-city trip range). `route_service` converts OSRM's meter output to
+both km (for display) and miles (for the model), and only the miles value is
+sent to `/predict`. No transformation, retraining, or new model feature was
+introduced — route-derived distance is a drop-in replacement for the manual
+slider value, nothing else.
+
+**Duration is not a model feature.** `cab_feature_cols.pkl` does not include
+duration, so OSRM's duration estimate is shown to the user for context only
+and is never sent to the pricing API. Adding it as a model input would
+require retraining, which is out of scope for this change.
+
+### Limitations
+
+- **Training-range extrapolation:** the model was trained on short in-city
+  trips (~0.1–10 miles). Long intercity routes (e.g. Pune → Mumbai, ~93 mi)
+  will still produce a price, but it's an extrapolation far outside the
+  training distribution — the UI shows a warning when route distance exceeds
+  10 miles.
+- **Public demo servers, not production infrastructure:** this integration
+  uses the public `nominatim.openstreetmap.org` and
+  `router.project-osrm.org` endpoints. Both are free but rate-limited and
+  offered on a best-effort basis with no uptime guarantee — they are **not
+  "unlimited free"** services. Nominatim in particular asks for at most
+  ~1 request/second per client and disallows heavy automated use; this
+  project honors that with request throttling and caching. For production
+  traffic, self-hosting Nominatim/OSRM or using a paid geocoding/routing
+  provider would be required.
+- **Geocoding ambiguity:** free-text place names can resolve to the wrong
+  location (e.g. a common place name that exists in multiple cities). The
+  route service takes Nominatim's top match; there's no disambiguation UI.
+- **Attribution:** per OpenStreetMap's license, map data is
+  © OpenStreetMap contributors, available under the
+  [Open Database License](https://www.openstreetmap.org/copyright).
 
 ---
 

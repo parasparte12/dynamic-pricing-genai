@@ -1,5 +1,9 @@
 import streamlit as st
 import requests
+import pandas as pd
+import pydeck as pdk
+
+from app.route_service import get_route_for_locations, RouteError
 
 API_BASE = "http://127.0.0.1:8000"
 
@@ -17,10 +21,22 @@ st.title("💰 Price Prediction")
 
 st.header("Predict a Cab Price")
 
+distance_mode = st.radio(
+    "How should distance be determined?",
+    options=["Manual distance", "Route-based (pickup & destination)"],
+    horizontal=True,
+)
+
 col1, col2 = st.columns(2)
 
 with col1:
-    distance = st.slider("Distance (miles)", 0.1, 10.0, 2.5)
+    if distance_mode == "Manual distance":
+        distance = st.slider("Distance (miles)", 0.1, 10.0, 2.5)
+        pickup, destination = None, None
+    else:
+        pickup = st.text_input("Pickup location", placeholder="e.g. Andheri, Mumbai")
+        destination = st.text_input("Destination", placeholder="e.g. Bandra, Mumbai")
+        distance = None
     surge_multiplier = st.slider("Surge Multiplier", 1.0, 3.0, 1.0)
     hour_of_day = st.slider("Hour of Day", 0, 23, 18)
     day_of_week = st.selectbox("Day of Week",
@@ -42,25 +58,101 @@ is_weekend = 1 if day_of_week in [5, 6] else 0
 is_rush_hour = 1 if hour_of_day in [7,8,9,16,17,18] else 0
 cab_type_encoded = 0 if cab_type == "Lyft" else 1
 
-if st.button("Predict Price", type="primary"):
-    payload = {
-        "distance": distance,
-        "surge_multiplier": surge_multiplier,
-        "hour_of_day": hour_of_day,
-        "day_of_week": day_of_week,
-        "is_weekend": is_weekend,
-        "is_rush_hour": is_rush_hour,
-        "is_raining": int(is_raining),
-        "cab_type_encoded": cab_type_encoded,
-        "name_encoded": name_encoded
-    }
-    try:
-        response = requests.post(f"{API_BASE}/predict", json=payload)
-        result = response.json()
-        st.success(f"### Predicted Price: ${result['predicted_price']}")
-        st.write(f"Expected range: ${result['price_range_low']} - ${result['price_range_high']}")
-    except requests.exceptions.ConnectionError:
-        st.error("Could not connect to the API. Make sure the FastAPI server is running.")
+is_route_mode = distance_mode == "Route-based (pickup & destination)"
+button_label = "Calculate Route & Predict Price" if is_route_mode else "Predict Price"
+
+if st.button(button_label, type="primary"):
+    route_result = None
+    route_failed = False
+
+    if is_route_mode:
+        if not pickup or not destination:
+            st.warning("Please enter both a pickup location and a destination.")
+            route_failed = True
+        else:
+            try:
+                with st.spinner("Geocoding locations and calculating route..."):
+                    route_result = get_route_for_locations(pickup, destination)
+                distance = route_result.distance_miles
+            except RouteError as e:
+                st.error(f"Could not calculate route: {e}")
+                route_failed = True
+
+    if not route_failed:
+        payload = {
+            "distance": distance,
+            "surge_multiplier": surge_multiplier,
+            "hour_of_day": hour_of_day,
+            "day_of_week": day_of_week,
+            "is_weekend": is_weekend,
+            "is_rush_hour": is_rush_hour,
+            "is_raining": int(is_raining),
+            "cab_type_encoded": cab_type_encoded,
+            "name_encoded": name_encoded
+        }
+        try:
+            response = requests.post(f"{API_BASE}/predict", json=payload)
+            result = response.json()
+
+            if route_result is not None:
+                st.subheader("Route")
+                st.caption(f"📍 Pickup: {route_result.origin}")
+                st.caption(f"🏁 Destination: {route_result.destination}")
+
+                rcol1, rcol2 = st.columns(2)
+                rcol1.metric("Distance", f"{route_result.distance_km} km ({route_result.distance_miles} mi)")
+                rcol2.metric("Est. Duration", f"{route_result.duration_minutes:.0f} min")
+
+                if route_result.distance_miles > 10:
+                    st.info(
+                        "This route is longer than the trip distances the pricing model was trained on "
+                        "(short in-city trips up to ~10 miles). The predicted price is an extrapolation "
+                        "and may be less reliable for long intercity routes."
+                    )
+
+                path_coords = [[lon, lat] for lat, lon in route_result.route_geometry]
+                origin_lat, origin_lon = route_result.origin_coordinates
+                dest_lat, dest_lon = route_result.destination_coordinates
+                mid_lat = (origin_lat + dest_lat) / 2
+                mid_lon = (origin_lon + dest_lon) / 2
+
+                if route_result.distance_km < 5:
+                    zoom = 12
+                elif route_result.distance_km < 20:
+                    zoom = 10
+                elif route_result.distance_km < 100:
+                    zoom = 7
+                else:
+                    zoom = 6
+
+                path_layer = pdk.Layer(
+                    "PathLayer",
+                    data=[{"path": path_coords}],
+                    get_path="path",
+                    get_width=4,
+                    width_min_pixels=3,
+                    get_color=[30, 144, 255],
+                )
+                markers_df = pd.DataFrame([
+                    {"position": [origin_lon, origin_lat], "color": [0, 160, 0]},
+                    {"position": [dest_lon, dest_lat], "color": [200, 30, 30]},
+                ])
+                marker_layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    data=markers_df,
+                    get_position="position",
+                    get_fill_color="color",
+                    get_radius=80,
+                    radius_min_pixels=6,
+                    radius_max_pixels=12,
+                )
+                view_state = pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=zoom)
+                st.pydeck_chart(pdk.Deck(layers=[path_layer, marker_layer], initial_view_state=view_state))
+
+            st.success(f"### Predicted Price: ${result['predicted_price']}")
+            st.write(f"Expected range: ${result['price_range_low']} - ${result['price_range_high']}")
+        except requests.exceptions.ConnectionError:
+            st.error("Could not connect to the API. Make sure the FastAPI server is running.")
 
 st.divider()
 st.header("✈️ Flight Price Prediction")

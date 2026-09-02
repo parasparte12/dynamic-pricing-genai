@@ -9,11 +9,12 @@ raw inputs into a price.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODEL_DIR = BASE_DIR / 'model'
@@ -84,3 +85,115 @@ def explain_cab_price(payload: Dict[str, Any]) -> Dict[str, Any]:
         "feature_values": feature_values,
         "shap_values": [float(v) for v in shap_values],
     }
+
+
+# ---------------------------------------------------------------------------
+# Structured pricing result.
+#
+# A serializable, single representation of "everything real the system knows
+# about one prediction" -- built strictly from the functions above (no
+# separate prediction logic). Intended for future consumers (GenAI tools,
+# a possible /explain endpoint) that need model output, input features,
+# route context, and SHAP data together instead of re-deriving any of it.
+# ---------------------------------------------------------------------------
+
+class RouteInfo(BaseModel):
+    origin: str
+    destination: str
+    distance_km: float
+    distance_miles: float
+    duration_minutes: float
+
+
+class ShapContribution(BaseModel):
+    feature_names: List[str]
+    feature_values: List[float]
+    shap_values: List[float]
+
+
+class ModelMetadata(BaseModel):
+    domain: str
+    model_version: str
+    feature_cols: List[str]
+
+
+class PricingResult(BaseModel):
+    success: bool
+    domain: str
+    predicted_price: float
+    price_range_low: float
+    price_range_high: float
+    input_features: Dict[str, float]
+    model_metadata: ModelMetadata
+    route: Optional[RouteInfo] = None
+    shap: Optional[ShapContribution] = None
+    error: Optional[str] = None
+
+
+def build_cab_pricing_result(
+    payload: Dict[str, Any],
+    route: Optional[RouteInfo] = None,
+    include_shap: bool = False,
+) -> PricingResult:
+    """Assemble a PricingResult for a cab prediction from real service output."""
+    metadata = ModelMetadata(domain="cab", model_version="cab_v1", feature_cols=list(cab_feature_cols))
+
+    try:
+        point, lower, upper = predict_cab_price_raw(payload)
+    except Exception as exc:
+        return PricingResult(
+            success=False,
+            domain="cab",
+            predicted_price=0.0,
+            price_range_low=0.0,
+            price_range_high=0.0,
+            input_features={},
+            model_metadata=metadata,
+            route=route,
+            error=str(exc),
+        )
+
+    shap_result: Optional[ShapContribution] = None
+    if include_shap:
+        shap_result = ShapContribution(**explain_cab_price(payload))
+
+    return PricingResult(
+        success=True,
+        domain="cab",
+        predicted_price=round(point, 2),
+        price_range_low=round(lower, 2),
+        price_range_high=round(upper, 2),
+        input_features=payload,
+        model_metadata=metadata,
+        route=route,
+        shap=shap_result,
+    )
+
+
+def build_flight_pricing_result(payload: Dict[str, Any]) -> PricingResult:
+    """Assemble a PricingResult for a flight prediction from real service output."""
+    metadata = ModelMetadata(domain="flights", model_version="flights_v1", feature_cols=list(flights_feature_cols))
+
+    try:
+        result = predict_flight_price(payload)
+    except Exception as exc:
+        return PricingResult(
+            success=False,
+            domain="flights",
+            predicted_price=0.0,
+            price_range_low=0.0,
+            price_range_high=0.0,
+            input_features={},
+            model_metadata=metadata,
+            error=str(exc),
+        )
+
+    return PricingResult(
+        success=True,
+        domain="flights",
+        predicted_price=result["predicted_price"],
+        price_range_low=result["price_range_low"],
+        price_range_high=result["price_range_high"],
+        input_features=payload,
+        model_metadata=metadata,
+    )

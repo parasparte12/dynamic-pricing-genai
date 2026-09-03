@@ -446,8 +446,17 @@ ollama serve
 python -m uvicorn api.main:app --reload
 
 # Terminal 3 -- Streamlit frontend (http://localhost:8501)
-streamlit run app/streamlit_app.py
+python -m streamlit run app/streamlit_app.py
 ```
+
+Run Streamlit via `python -m streamlit run ...` (not the bare `streamlit
+run ...`), from the project root. The pages under `app/pages/` import
+`app.route_service` and `api.pricing_service` using absolute imports, which
+requires the project root to be on `sys.path`; Streamlit's own script runner
+only ever adds the main script's directory (`app/`), never the project
+root, so the bare `streamlit` command fails with `ModuleNotFoundError: No
+module named 'app'` / `'api'`. `python -m` guarantees the current directory
+(the project root, since you `cd`'d there first) is added to `sys.path`.
 
 Open **http://localhost:8501** and navigate the sidebar between Price
 Prediction, What-If Simulator, AI Assistant, SHAP Explanations, and

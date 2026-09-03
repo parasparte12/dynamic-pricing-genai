@@ -444,3 +444,23 @@ def recompute_cab_price(
         percentage_change=round(percentage_change, 2) if percentage_change is not None else None,
         modifications=applied,
     )
+
+
+class RouteRecomputeResult(BaseModel):
+    """Result of a route-aware recomputation ("what if I change destination?").
+
+    A pure data shape only -- this module has no dependency on the routing
+    layer (app.route_service). The function that actually resolves routes
+    and produces this result lives in api.pricing_agent, which is where
+    the routing and pricing layers are allowed to meet.
+    """
+    success: bool
+    original_route: Optional[RouteInfo] = None
+    new_route: Optional[RouteInfo] = None
+    original: Optional[PricingResult] = None
+    new: Optional[PricingResult] = None
+    difference: Optional[float] = None
+    percentage_change: Optional[float] = None
+    modifications: Optional[Dict[str, Dict[str, float]]] = None
+    error: Optional[str] = None
+    message: Optional[str] = None

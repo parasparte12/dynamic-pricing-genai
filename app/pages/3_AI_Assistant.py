@@ -198,6 +198,20 @@ def _is_model_missing_error(exc: Exception) -> bool:
     return "not found" in text or "pull" in text
 
 
+def _is_demand_request(user_message: str) -> bool:
+    """Deterministic, application-level guard: True if the CURRENT user turn's wording asks
+    about "demand", a feature the pricing model does not support.
+
+    This is enforced independently of the system prompt. Even if Ollama incorrectly generates
+    a tool call for a demand question -- e.g. treating "demand increases 20%" as a
+    surge_multiplier change -- the application refuses to execute that call rather than
+    trusting the model's interpretation, so the prompt-level rule cannot be bypassed by a
+    fabricated tool call. Deliberately a plain keyword check, not an NLP classifier: per the
+    design requirement, ambiguous demand wording should be refused rather than guessed at.
+    """
+    return "demand" in user_message.lower()
+
+
 def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
     """Run one grounded assistant turn: Ollama decides, real tools execute, Ollama explains.
 
@@ -271,6 +285,21 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
                     "success": False,
                     "error": "malformed_tool_arguments",
                     "message": f"Arguments for '{name}' were not a valid object.",
+                }
+            elif _is_demand_request(user_message):
+                tool_result = {
+                    "success": False,
+                    "error": "unsupported_feature_demand",
+                    "message": (
+                        "'demand' is not a feature the pricing model supports, so the "
+                        "application blocked this tool call before execution rather than "
+                        "letting it substitute another feature (such as surge_multiplier) on "
+                        "the model's behalf. Tell the user plainly that demand is not "
+                        "supported. You may mention, in text only, that surge_multiplier is "
+                        "the closest supported feature -- but only call a tool for it if the "
+                        "user explicitly asks to change surge_multiplier themselves in a "
+                        "separate, later message."
+                    ),
                 }
             else:
                 try:

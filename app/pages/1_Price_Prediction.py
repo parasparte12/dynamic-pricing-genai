@@ -4,6 +4,7 @@ import pandas as pd
 import pydeck as pdk
 
 from app.route_service import get_route_for_locations, RouteError
+from api.pricing_service import explain_cab_price
 
 API_BASE = "http://127.0.0.1:8000"
 
@@ -93,6 +94,28 @@ if st.button(button_label, type="primary"):
         try:
             response = requests.post(f"{API_BASE}/predict", json=payload)
             result = response.json()
+
+            try:
+                shap_data = explain_cab_price(payload)
+            except Exception:
+                shap_data = None
+
+            st.session_state.current_prediction = {
+                "domain": "cab",
+                "mode": "route" if route_result is not None else "manual",
+                "origin": route_result.origin if route_result is not None else None,
+                "destination": route_result.destination if route_result is not None else None,
+                "route": {
+                    "distance_km": route_result.distance_km,
+                    "distance_miles": route_result.distance_miles,
+                    "duration_minutes": route_result.duration_minutes,
+                } if route_result is not None else None,
+                "input_features": payload,
+                "predicted_price": result["predicted_price"],
+                "price_range_low": result["price_range_low"],
+                "price_range_high": result["price_range_high"],
+                "shap": shap_data,
+            }
 
             if route_result is not None:
                 st.subheader("Route")
@@ -190,6 +213,20 @@ if st.button("Predict Flight Price", type="primary"):
         try:
             response = requests.post(f"{API_BASE}/predict_flight", json=flight_payload)
             result = response.json()
+
+            st.session_state.current_prediction = {
+                "domain": "flight",
+                "mode": None,
+                "origin": None,
+                "destination": None,
+                "route": None,
+                "input_features": flight_payload,
+                "predicted_price": result["predicted_price"],
+                "price_range_low": result["price_range_low"],
+                "price_range_high": result["price_range_high"],
+                "shap": None,
+            }
+
             st.success(f"### Predicted Price: ₹{result['predicted_price']}")
             st.write(f"Expected range: ₹{result['price_range_low']} - ₹{result['price_range_high']}")
         except requests.exceptions.ConnectionError:

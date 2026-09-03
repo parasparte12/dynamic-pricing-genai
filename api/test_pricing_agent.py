@@ -1,5 +1,5 @@
 import ollama
-from pricing_agent import what_if_price_change, whatif_tool_definition
+from api.pricing_agent import what_if_price_change, whatif_tool_definition
 
 def ask_agent(user_question):
     print(f"\n{'='*60}\nUSER: {user_question}\n{'='*60}")

@@ -28,9 +28,12 @@ If you need to check the model list:
 ollama list
 ```
 
-If the model is missing:
+If the model is missing (the AI Assistant's primary model is `qwen2.5:7b`,
+chosen for reliable tool-calling; `mistral` is only an automatic fallback if
+`qwen2.5:7b` is unavailable):
 
 ```powershell
+ollama pull qwen2.5:7b
 ollama pull mistral
 ```
 
@@ -73,7 +76,7 @@ From a terminal:
 ```powershell
 cd "C:\Users\Paras\Desktop\dynamic-pricing-genai\dynamic-pricing-genai"
 .\venv\Scripts\Activate.ps1
-python -c "import ollama; response = ollama.chat(model='mistral', messages=[{'role': 'user', 'content': 'What is surge pricing in ride-hailing? Answer in one sentence.'}], stream=False); print(response.get('message', {}).get('content', 'ERROR'))"
+python -c "import ollama; response = ollama.chat(model='qwen2.5:7b', messages=[{'role': 'user', 'content': 'What is surge pricing in ride-hailing? Answer in one sentence.'}], stream=False); print(response.get('message', {}).get('content', 'ERROR'))"
 ```
 
 ## 7) Optional: test the prediction API manually

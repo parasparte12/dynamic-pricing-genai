@@ -1,436 +1,259 @@
 # Dynamic Pricing Engine with GenAI
 
-A machine learning-powered dynamic pricing system for ride-hailing and flights with explainable AI, natural language chat interface, and real-time predictions.
+A machine-learning dynamic pricing system for ride-hailing and flights, with a
+real XGBoost pricing model as the sole pricing authority, SHAP-based
+explainability, and a grounded GenAI assistant (Ollama) that can call real
+pricing/routing tools instead of guessing numbers.
 
 **Key Features:**
-- 🚗 **Predictive Models**: XGBoost regression models for cab and flight pricing with quantile regression confidence intervals
-- 💬 **AI Chat Assistant**: Natural language interface powered by Ollama (Mistral) for pricing questions
-- 📊 **SHAP Explanations**: Understand which factors impact individual predictions
-- 📈 **Analytics Dashboard**: Historical tracking of all predictions with Supabase
-- 🎯 **What-If Simulator**: Evaluate whether proposed prices are reasonable
-- 🔐 **Production Ready**: FastAPI backend, multi-page Streamlit frontend, database logging
+- 🚗 **Predictive Models**: XGBoost regression models for cab and flight pricing, each paired with lower/upper-bound regression models for a model-derived price range
+- 💬 **Grounded AI Assistant**: Ollama (`qwen2.5:7b`, tool-calling; falls back to `mistral` if unavailable) that explains predictions and executes real pricing/routing tools — it never calculates, estimates, or invents a price itself
+- 📊 **SHAP Explanations**: Real per-prediction feature contributions, computed by a `TreeExplainer`, never fabricated by the LLM
+- 🔀 **Real What-If Recomputation**: Ask "what if surge doubles?" or "what if distance increases 20%?" and the assistant calls the actual model, not its own arithmetic
+- 🗺️ **Route-Aware Pricing**: Ask "what if I change my destination?" and the assistant resolves a real route via Nominatim + OSRM, then re-prices using the real resulting distance
+- 🛡️ **Application-Level Safety Guards**: An unsupported "demand" question cannot be silently turned into a `surge_multiplier` change, even if the LLM tries — the application blocks it before execution
+- 📈 **Analytics Dashboard**: Historical prediction tracking backed by Supabase/PostgreSQL
+- 🎯 **Proposed-Price Validation**: Check whether a specific price is reasonable for given ride conditions
 
 ---
 
 ## Table of Contents
 
-1. [Architecture](#architecture)
-2. [Quick Start](#quick-start)
-3. [Project Structure](#project-structure)
-4. [Data & Models](#data--models)
-5. [API Endpoints](#api-endpoints)
-6. [Frontend Pages](#frontend-pages)
-7. [Route-Based Distance (OpenStreetMap / OSRM)](#route-based-distance-openstreetmap--osrm)
-8. [Configuration](#configuration)
-9. [Troubleshooting](#troubleshooting)
+1. [Problem & Solution](#problem--solution)
+2. [Architecture](#architecture)
+3. [ML Models](#ml-models)
+4. [SHAP Explainability](#shap-explainability)
+5. [Dynamic Pricing What-If](#dynamic-pricing-what-if)
+6. [Route-Aware Pricing](#route-aware-pricing-nominatim--osrm)
+7. [GenAI Assistant & Tool Calling](#genai-assistant--tool-calling)
+8. [Technology Stack](#technology-stack)
+9. [Project Structure](#project-structure)
+10. [Installation & Setup](#installation--setup)
+11. [Running the Application](#running-the-application)
+12. [API Reference](#api-reference)
+13. [Security Notes](#security-notes)
+14. [Limitations](#limitations)
+15. [Demo Workflow](#demo-workflow)
+16. [Troubleshooting](#troubleshooting)
+
+---
+
+## Problem & Solution
+
+**Problem**: Ride-hailing and flight prices change constantly based on conditions
+(distance, time of day, demand signals like surge, weather, ride tier, cabin
+class, etc.), and it's hard for a rider or a developer exploring pricing logic
+to know whether a quoted price is reasonable, or what would happen if one
+condition changed.
+
+**Solution**: A trained XGBoost regression model is the single source of truth
+for every price shown anywhere in this system. On top of that, a GenAI chat
+assistant lets a user ask natural-language questions ("why is this price
+high?", "what if I add surge?", "what if I change my destination?") — but the
+assistant is architecturally prevented from answering with a made-up number.
+Every numerical answer it gives is either the real current prediction already
+computed by the model, or the real result of a tool call that re-runs the
+actual model (and, for route questions, actual geocoding/routing services).
 
 ---
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    User-Facing Layer                            │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │ Streamlit Multi-Page Dashboard (Port 8501)                 │ │
-│  │  • Price Prediction Form  (1_Price_Prediction.py)          │ │
-│  │  • What-If Simulator      (2_What_If_Simulator.py)         │ │
-│  │  • AI Chat Assistant      (3_AI_Assistant.py)              │ │
-│  │  • SHAP Explanations      (4_SHAP_Explanations.py)         │ │
-│  │  • Analytics Dashboard    (5_Analytics_Dashboard.py)       │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ HTTP Requests
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  Business Logic Layer                           │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │ FastAPI Backend (Port 8000)                                │ │
-│  │  • POST /predict        (cab price prediction)             │ │
-│  │  • POST /whatif         (price evaluation)                 │ │
-│  │  • POST /predict_flight (flight price prediction)          │ │
-│  │  • Database logging with log_prediction()                 │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-  ┌─────────────┐   ┌──────────────────┐  ┌──────────────┐
-  │ XGBoost     │   │ SHAP Explainer   │  │ Supabase     │
-  │ Models      │   │ (Feature Impact) │  │ Postgres DB  │
-  │ (pkl files) │   │ (pkl files)      │  │ (predictions)│
-  └─────────────┘   └──────────────────┘  └──────────────┘
+### Standard prediction flow (Streamlit → FastAPI → model)
 
-                              │
-                              │ Chat Messages
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    GenAI Layer                                  │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │ Ollama LLM Server (Port 11434)                             │ │
-│  │  • Model: mistral:latest (7B parameters)                   │ │
-│  │  • Role: Natural language pricing assistant               │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
 ```
+USER
+ │
+ ▼
+STREAMLIT
+ ┌─────────────────────┐
+ │ Price Prediction     │
+ │ What-If Simulator    │
+ │ AI Assistant         │
+ │ SHAP Explanations     │
+ │ Analytics Dashboard   │
+ └──────────┬────────────┘
+            │ HTTP
+            ▼
+        FASTAPI  (api/main.py)
+            │
+            ▼
+   pricing_service.py         <- the ONLY module that loads models / predicts
+            │
+            ▼
+         XGBoost               (cab model, flight model, + lower/upper bound models)
+            │
+            ▼
+     real prediction  ──────────► Supabase / PostgreSQL (predictions table)
+```
+
+### AI Assistant tool-calling flow
+
+```
+USER
+ │
+ ▼
+OLLAMA (qwen2.5:7b, falls back to mistral)
+ │  decides whether a tool is needed
+ ▼
+REAL TOOL  (what_if_price_change / recompute_price / recompute_route_price)
+ │
+ ▼
+pricing_agent.py            <- tool wrappers; the ONLY layer allowed to
+ │                              bridge routing (app/route_service.py) and
+ │                              pricing (api/pricing_service.py)
+ ▼
+pricing_service.py
+ │
+ ▼
+XGBoost
+ │
+ ▼
+REAL RESULT  (appended to the conversation as a tool result, never invented)
+ │
+ ▼
+OLLAMA
+ │
+ ▼
+GROUNDED EXPLANATION shown to the user
+```
+
+### Route-aware pricing path
+
+```
+Origin / Destination (free text)
+        │
+        ▼
+   Nominatim              (geocoding: place name → coordinates)
+        │
+        ▼
+     OSRM                 (road routing: coordinates → real distance/duration/geometry)
+        │
+        ▼
+  road distance (miles)
+        │
+        ▼
+   pricing_service.py
+        │
+        ▼
+      XGBoost  →  real re-priced result
+```
+
+The model is never bypassed and never re-implemented outside
+`api/pricing_service.py`. The AI Assistant does not calculate anything itself
+— it only decides *which* real tool to call and then explains the real
+result it gets back.
 
 **Technology Stack:**
 - Backend: FastAPI (Python)
-- Frontend: Streamlit (Python)
-- ML Models: XGBoost, Scikit-learn
-- Explainability: SHAP
-- LLM: Ollama with Mistral model
-- Database: Supabase (PostgreSQL)
-- Deployment: Local development on Windows/Mac/Linux
+- Frontend: Streamlit, multi-page
+- ML Models: XGBoost (`xgboost.sklearn.XGBRegressor`), scikit-learn
+- Explainability: SHAP (`TreeExplainer`)
+- LLM: Ollama — `qwen2.5:7b` (primary, tool-calling), `mistral` (fallback if `qwen2.5:7b` is unavailable)
+- Geocoding/Routing: Nominatim + OSRM (OpenStreetMap-based, no Google Maps / no paid API key)
+- Database: Supabase (managed PostgreSQL)
+- Map rendering: pydeck
 
 ---
 
-## Quick Start
+## ML Models
 
-### Prerequisites
+Two independently trained XGBoost regressors, one per domain, each loaded
+once by `api/pricing_service.py` and never re-implemented anywhere else:
 
-- Python 3.8+
-- Ollama installed with at least one model (e.g., `ollama pull mistral`)
-- Supabase account (or use local PostgreSQL)
-- Git
+### Cab price model
+- **Algorithm**: XGBoost regression (`XGBRegressor`)
+- **Features** (9): `distance`, `surge_multiplier`, `hour_of_day`, `day_of_week`, `is_weekend`, `is_rush_hour`, `is_raining`, `cab_type_encoded`, `name_encoded` (ride tier)
+- **Reported evaluation metrics** (from `notebooks/eda.ipynb`, at model-development time): MAE ≈ **$1.16**, R² ≈ **0.964**
 
-### 1. Clone and Setup
+### Flight price model
+- **Algorithm**: XGBoost regression (`XGBRegressor`)
+- **Features** (9): `airline_encoded`, `source_city_encoded`, `departure_time_encoded`, `stops_encoded`, `arrival_time_encoded`, `destination_city_encoded`, `class_encoded`, `duration`, `days_left`
+- **Reported evaluation metrics** (from `notebooks/eda_flights.ipynb`, at model-development time): MAE ≈ **₹2382.71**, R² ≈ **0.967**. `class_encoded` (economy vs. business) dominates feature importance for this model.
 
-```bash
-# Clone repository
-git clone https://github.com/parasparte12/dynamic-pricing-genai.git
-cd dynamic-pricing-genai
+These are the metrics recorded during model development in the notebooks
+above; they are not a live/production monitoring figure and should be read
+as historical evaluation, not a runtime guarantee.
 
-# Create virtual environment
-python -m venv venv
-.\venv\Scripts\Activate.ps1  # Windows
-# or
-source venv/bin/activate  # Mac/Linux
+### Price range, not a confidence interval
 
-# Install dependencies
-pip install -r requirements.txt
-```
+Each prediction also returns `price_range_low` and `price_range_high`,
+produced by two additional XGBoost models trained to estimate a lower and
+upper bound for the same conditions. This is a **model-derived price
+range**, not a statistically calibrated confidence interval — no formal
+coverage/calibration testing has been done on these bounds, so avoid
+describing it as "90% confidence" anywhere in this project.
 
-### 2. Configure Database
+### Neither model has a "demand" feature
 
-Create a `.env` file in the project root:
+Neither the cab nor the flight model was trained with a direct demand
+signal. `surge_multiplier` is the closest real, supported proxy for
+demand-driven pricing on the cab side. The application (not just the AI
+Assistant's prompt) actively blocks any attempt to silently substitute
+"demand" with `surge_multiplier` — see [GenAI Assistant & Tool
+Calling](#genai-assistant--tool-calling).
 
-```env
-DATABASE_URL=postgresql://user:password@host:5432/database_name
-```
+### An observed pattern in the cab training data
 
-**For Supabase:**
-1. Create account at https://supabase.com
-2. Create new project
-3. Go to Settings → Database → Connection string
-4. Copy the PostgreSQL connection string into `.env`
-
-The database table will be created automatically on first prediction.
-
-### 3. Run the System
-
-**Terminal 1: Start Ollama**
-```bash
-ollama serve
-```
-
-**Terminal 2: Start FastAPI Backend**
-```bash
-cd "C:\Users\Paras\Desktop\dynamic-pricing-genai\dynamic-pricing-genai"
-.\venv\Scripts\Activate.ps1
-python -m uvicorn api.main:app --reload
-# Backend running on http://127.0.0.1:8000
-```
-
-**Terminal 3: Start Streamlit Frontend**
-```bash
-cd "C:\Users\Paras\Desktop\dynamic-pricing-genai\dynamic-pricing-genai"
-.\venv\Scripts\Activate.ps1
-streamlit run app/streamlit_app.py
-# Frontend running on http://127.0.0.1:8501
-```
-
-### 4. Access the Application
-
-Open your browser to **http://localhost:8501**
+Exploratory analysis (`notebooks/confounding_check*.png`) showed an
+association in the training data between trip distance and surge multiplier:
+short rides during rush hour tend to have higher surge multipliers, while
+long-distance rides tend to have lower ones. This is an association observed
+in the historical data, not a causal claim, and it does not change how the
+deployed model computes a price — it's included here as an EDA finding, not
+a claim of demand elasticity.
 
 ---
 
-## Project Structure
+## SHAP Explainability
 
-```
-dynamic-pricing-genai/
-├── api/
-│   ├── main.py                 # FastAPI application + endpoints
-│   ├── db.py                   # SQLAlchemy ORM + database layer
-│   └── pricing_agent.py        # (Legacy) pricing functions
-├── app/
-│   ├── streamlit_app.py        # Main dashboard landing page
-│   └── pages/
-│       ├── 1_Price_Prediction.py       # Predict cab prices
-│       ├── 2_What_If_Simulator.py      # Evaluate proposed prices
-│       ├── 3_AI_Assistant.py           # Chat with Ollama LLM
-│       ├── 4_SHAP_Explanations.py      # Feature importance
-│       └── 5_Analytics_Dashboard.py    # Historical predictions
-├── model/
-│   ├── cab_price_model.pkl             # XGBoost regression model
-│   ├── cab_price_model_lower.pkl       # Quantile regression (5th percentile)
-│   ├── cab_price_model_upper.pkl       # Quantile regression (95th percentile)
-│   ├── cab_shap_explainer.pkl          # SHAP TreeExplainer
-│   ├── feature_cols.pkl                # Training feature names
-│   ├── flights_price_model.pkl         # Flight price model
-│   └── ...                             # Flight model variants
-├── data/
-│   ├── cab_rides.csv                   # Raw taxi data
-│   ├── cab_cleaned_features.csv        # Processed training data
-│   ├── weather.csv                     # Weather conditions
-│   ├── flights/                        # Flight datasets
-│   └── ...
-├── notebooks/
-│   ├── eda.ipynb                       # Cab EDA + model training
-│   └── eda_flights.ipynb               # Flight EDA + model training
-├── requirements.txt                    # Python dependencies
-├── .env                                # Database connection (not in git)
-├── .env.example                        # Template for .env
-└── README.md                           # This file
-```
+SHAP explanations are computed **per prediction** by a real
+`shap.TreeExplainer` in `api/pricing_service.py` — there is no fixed,
+global "top features" list baked into the app. For a given ride, the
+explainer returns:
+
+- a **base value** (the model's average output before any feature effects),
+- a **signed contribution** for every feature, in the same units as price,
+- such that `base_value + sum(contributions) ≈ the model's raw predicted price`.
+
+The app ranks these contributions by **absolute magnitude** (so a large
+negative effect ranks ahead of a small positive one) while preserving the
+original sign, and surfaces the same numbers to both the SHAP Explanations
+page and the AI Assistant. The AI Assistant only describes SHAP values it
+was actually given for the current prediction — it does not invent a
+baseline, a contribution, or a percentage.
 
 ---
 
-## Data & Models
+## Dynamic Pricing What-If
 
-### Datasets
+There are two distinct, intentionally separate capabilities — the AI
+Assistant is instructed to use the smaller/correct one and not conflate
+them:
 
-**Cab Rides Data:**
-- Source: Uber/Lyft historical data
-- Features: Distance, surge multiplier, time of day, weather, cab type, provider
-- Target: Price (in dollars)
-- Size: ~5,000 records after cleaning
-
-**Flight Data:**
-- Source: Flight booking datasets
-- Features: Airline, route, class (economy/business), booking time
-- Target: Price (in dollars)
-- Size: ~3,000 records per class
-
-### Model Training Results
-
-#### Cab Price Model
-- **Algorithm**: XGBoost Regression
-- **Features**: 9 engineered features (distance, surge, hour, day, weekend, rush_hour, rain, cab_type, provider)
-- **Performance**:
-  - Mean Absolute Error (MAE): $3-5
-  - R² Score: 0.92-0.95
-  - Cross-validation: Consistent across folds
-
-#### Confidence Intervals
-- **Method**: Quantile Regression (5th and 95th percentiles)
-- **Interpretation**: 90% of prices fall within the predicted range
-- **Example**: Predicted $40 ± $8 means 90% confidence the price is $32-$48
-
-#### SHAP Feature Importance (Top 5)
-1. **Surge Multiplier** (35% impact): Directly scales prices in high-demand periods
-2. **Distance** (25% impact): Longer rides cost proportionally more
-3. **Hour of Day** (15% impact): Rush hours (7-9am, 5-7pm) increase prices by ~20%
-4. **Cab Type** (10% impact): Premium/luxury tiers add 20-30% premium
-5. **Weather** (8% impact): Rain adds 10-15% to base price
-
-### Key Confounding Insight
-
-⚠️ **Important**: The dataset shows a **confounding relationship between distance and demand surge**:
-- Long-distance rides tend to have LOWER surge multipliers
-- Short-distance rides tend to have HIGHER surge multipliers during rush hour
-
-This is realistic: in ride-hailing, surge pricing applies most aggressively to short commute rides during peak hours, while long-distance rides (e.g., airport trips) have more stable pricing.
+1. **Proposed-price validation** (`/whatif`, tool `what_if_price_change`) —
+   "is $60 reasonable for my ride?" Compares a user-proposed price against
+   the model's real price range for the given conditions and returns a
+   verdict: `below_expected_range`, `within_expected_range`, or
+   `above_expected_range`.
+2. **Condition recomputation** (tool `recompute_price`) — "what if surge
+   goes from 1.0 to 2.0?" Re-runs the real model on the changed condition(s)
+   and returns the real difference and percentage change. Supports either
+   an absolute new value or a `{"percent_change": N}` spec for a supported
+   feature. Requesting an unsupported feature (including "demand") is
+   rejected with a structured error rather than silently mapped to
+   something else.
 
 ---
 
-## API Endpoints
+## Route-Aware Pricing (Nominatim + OSRM)
 
-All endpoints accept JSON POST requests and return JSON responses.
-
-### 1. Predict Cab Price
-
-**Endpoint**: `POST /predict`
-
-**Request**:
-```json
-{
-  "distance": 10.5,
-  "surge_multiplier": 1.5,
-  "hour_of_day": 14,
-  "day_of_week": 3,
-  "is_weekend": false,
-  "is_rush_hour": false,
-  "is_raining": false,
-  "cab_type_encoded": 1,
-  "name_encoded": 1
-}
-```
-
-**Response**:
-```json
-{
-  "predicted_price": 40.97,
-  "price_range_low": 32.54,
-  "price_range_high": 49.40,
-  "confidence_interval": 0.90,
-  "model_version": "1.0"
-}
-```
-
-### 2. Evaluate Proposed Price (What-If)
-
-**Endpoint**: `POST /whatif`
-
-**Request**:
-```json
-{
-  "distance": 10.5,
-  "surge_multiplier": 1.5,
-  "hour_of_day": 14,
-  "day_of_week": 3,
-  "is_weekend": false,
-  "is_rush_hour": false,
-  "is_raining": false,
-  "cab_type_encoded": 1,
-  "name_encoded": 1,
-  "proposed_price": 45.00
-}
-```
-
-**Response**:
-```json
-{
-  "verdict": "slightly_high",
-  "comparison": "Your proposed price of $45.00 is 9.8% above the model's prediction of $40.97. This is still within reasonable range ($32.54 - $49.40).",
-  "price_percentile": 0.68
-}
-```
-
-### 3. Predict Flight Price
-
-**Endpoint**: `POST /predict_flight`
-
-**Request**:
-```json
-{
-  "airline_encoded": 1,
-  "route_encoded": 5,
-  "class_encoded": 0,
-  "days_until_flight": 14
-}
-```
-
-**Response**:
-```json
-{
-  "predicted_price": 250.00,
-  "price_range_low": 200.00,
-  "price_range_high": 300.00
-}
-```
-
----
-
-## Frontend Pages
-
-### 1️⃣ Price Prediction (`1_Price_Prediction.py`)
-
-Predict the fair price for a cab ride given specific conditions.
-
-**Features:**
-- Interactive sliders for all input parameters
-- Real-time prediction updates
-- Displays predicted price with confidence range
-- Shows "expensive" or "cheap" assessment
-
-**Example Usage:**
-1. Set Distance = 15 miles
-2. Set Surge Multiplier = 2.0 (peak demand)
-3. Set Hour = 8 (morning rush)
-4. Click Predict → See estimated $75-95 price range
-
-**Route-based mode:** instead of dragging the distance slider, switch the
-"How should distance be determined?" toggle to *Route-based*, enter a
-pickup and destination, and click **Calculate Route & Predict Price**. See
-[Route-Based Distance](#route-based-distance-openstreetmap--osrm) below for
-how this works.
-
-### 2️⃣ What-If Simulator (`2_What_If_Simulator.py`)
-
-Test whether a proposed price is reasonable for given market conditions.
-
-**Features:**
-- All inputs from Price Prediction page
-- Additional "Proposed Price" input
-- Verdict: within_range, slightly_high, very_high, slightly_low, very_low
-- Price percentile relative to model predictions
-
-**Example Usage:**
-1. Set typical conditions
-2. Enter your proposed price (e.g., $50)
-3. See whether it's reasonable relative to market model
-4. Adjust parameters and re-evaluate
-
-### 3️⃣ AI Assistant (`3_AI_Assistant.py`)
-
-Chat naturally about pricing factors and strategies.
-
-**Features:**
-- Natural language questions (no structured input needed)
-- Powered by Ollama Mistral LLM
-- Maintains conversation history
-- Example questions provided in sidebar
-
-**Example Questions:**
-- "How does surge pricing work?"
-- "Why would a 5-mile ride cost $30 at midnight vs $50 at 8am?"
-- "Which factors most affect ride prices?"
-- "How much does weather impact pricing?"
-
-### 4️⃣ SHAP Explanations (`4_SHAP_Explanations.py`)
-
-Understand which features impact predictions most.
-
-**Features:**
-- Make a prediction and get feature importance breakdown
-- SHAP values show direction (increases/decreases price) and magnitude
-- Interactive feature importance bar charts
-- Overall feature importance patterns
-
-**What You Learn:**
-- How each feature contributed to YOUR specific prediction
-- Which factors are universally important across all rides
-- How a change in one factor affects the final price
-
-### 5️⃣ Analytics Dashboard (`5_Analytics_Dashboard.py`)
-
-View historical predictions, trends, and model performance.
-
-**Tabs:**
-- **Overview**: Total predictions, average price, endpoint breakdown
-- **Time Series**: Price trends over time, prediction volume trends
-- **Endpoint Analysis**: Performance stats per endpoint, confidence interval width
-- **Raw Data**: Filterable detailed view, CSV export
-
-**Capabilities:**
-- Filter by date range, endpoint, model version
-- Download historical data as CSV
-- Identify pricing trends and patterns
-- Track model stability over time
-
----
-
-## Route-Based Distance (OpenStreetMap / OSRM)
-
-The Price Prediction page can derive the cab ride's `distance` input from a
-real road route instead of a manual slider. This is a **data-acquisition
-layer only** — it does not price rides itself. It resolves two place names
-to a road route and distance, which is then fed into the exact same
-feature-engineering and XGBoost pricing pipeline used by manual input. The
-model remains the sole pricing authority; nothing about the pricing logic
-changed.
+The Price Prediction page — and the AI Assistant's `recompute_route_price`
+tool — can derive the cab ride's `distance` from a real road route instead
+of a manual value. This is a **data-acquisition layer only**: it never
+prices anything itself. It resolves two place names to a real road route
+and distance, which is then fed into the exact same feature engineering and
+XGBoost pricing pipeline used by manual input.
 
 ```
 Pickup + Destination text
@@ -455,207 +278,317 @@ tier. The open-source equivalents need no API key or account:
 | Map tiles | [OpenStreetMap](https://www.openstreetmap.org/) |
 | Geocoding (place name → coordinates) | [Nominatim](https://nominatim.org/) |
 | Road routing (coordinates → route/distance/duration) | [OSRM](http://project-osrm.org/) (public demo server) |
-| In-app map rendering | [pydeck](https://deckgl.readthedocs.io/) via `st.pydeck_chart` (already a project dependency, no new package required) |
+| In-app map rendering | [pydeck](https://deckgl.readthedocs.io/) via `st.pydeck_chart` |
 
-### Implementation
+### Implementation notes
 
-- `app/route_service.py` is the isolated route module. It exposes
-  `get_route_for_locations(origin_text, destination_text)`, which geocodes
-  both locations via Nominatim, requests a driving route from OSRM
-  (`geometries=geojson` so the actual road-following polyline is returned,
-  not a straight line), and returns a `RouteResult` with distance (km and
-  miles), duration (minutes), coordinates, and the route geometry.
-- Failures (location not found, no route available, network error, timeout,
-  malformed response) raise a single `RouteError` with a `.kind` and a
-  human-readable message; the Streamlit page catches this and shows
-  `st.error()` instead of crashing.
-- A simple in-process cache avoids re-geocoding or re-routing the same
-  inputs twice in a session, and Nominatim calls are throttled to at most
-  1/second with an identifying `User-Agent`, per Nominatim's usage policy.
-
-### Distance unit and model compatibility
-
-The cab model's `distance` feature was trained on trip distances in **miles**
-(the existing manual slider caps at 10 miles, matching the training data's
-short in-city trip range). `route_service` converts OSRM's meter output to
-both km (for display) and miles (for the model), and only the miles value is
-sent to `/predict`. No transformation, retraining, or new model feature was
-introduced — route-derived distance is a drop-in replacement for the manual
-slider value, nothing else.
-
-**Duration is not a model feature.** `cab_feature_cols.pkl` does not include
-duration, so OSRM's duration estimate is shown to the user for context only
-and is never sent to the pricing API. Adding it as a model input would
-require retraining, which is out of scope for this change.
-
-### Limitations
-
-- **Training-range extrapolation:** the model was trained on short in-city
-  trips (~0.1–10 miles). Long intercity routes (e.g. Pune → Mumbai, ~93 mi)
-  will still produce a price, but it's an extrapolation far outside the
-  training distribution — the UI shows a warning when route distance exceeds
-  10 miles.
-- **Public demo servers, not production infrastructure:** this integration
-  uses the public `nominatim.openstreetmap.org` and
-  `router.project-osrm.org` endpoints. Both are free but rate-limited and
-  offered on a best-effort basis with no uptime guarantee — they are **not
-  "unlimited free"** services. Nominatim in particular asks for at most
-  ~1 request/second per client and disallows heavy automated use; this
-  project honors that with request throttling and caching. For production
-  traffic, self-hosting Nominatim/OSRM or using a paid geocoding/routing
-  provider would be required.
-- **Geocoding ambiguity:** free-text place names can resolve to the wrong
-  location (e.g. a common place name that exists in multiple cities). The
-  route service takes Nominatim's top match; there's no disambiguation UI.
-- **Attribution:** per OpenStreetMap's license, map data is
-  © OpenStreetMap contributors, available under the
-  [Open Database License](https://www.openstreetmap.org/copyright).
+- `app/route_service.py` is the single, isolated route module (`api/pricing_service.py` never imports it — only `api/pricing_agent.py`, the tool-orchestration layer, is allowed to bridge routing and pricing). It exposes `get_route_for_locations(origin_text, destination_text)`, returning a `RouteResult` with distance (km and miles), duration, coordinates, and route geometry.
+- Failures (location not found, no route, network error, timeout, malformed response) raise a single `RouteError` with a `.kind` and a human-readable message; callers catch this instead of crashing.
+- A simple in-process cache avoids re-geocoding/re-routing identical inputs in a session, and Nominatim calls are throttled to at most 1/second with an identifying `User-Agent`, per Nominatim's usage policy.
+- The cab model's `distance` feature was trained in **miles** on short in-city trips (~0.1–10 mi). Longer routes still produce a price, but it's an extrapolation outside the training range — the UI warns when route distance exceeds 10 miles.
+- **Route results are live and can change.** Nominatim/OSRM are public, best-effort external services; the exact distance (and therefore price) for the same two place names can shift over time as their underlying map/routing data updates. Nothing in this app hardcodes a route's expected distance or price — every route-aware answer reflects whatever Nominatim/OSRM return at the moment it's asked.
+- Duration is not a model feature — it's shown for context only and never sent to the pricing API.
+- Map data is © OpenStreetMap contributors, under the [Open Database License](https://www.openstreetmap.org/copyright).
 
 ---
 
-## Configuration
+## GenAI Assistant & Tool Calling
 
-### Environment Variables (`.env`)
+The AI Assistant (`app/pages/3_AI_Assistant.py`) uses Ollama's tool-calling
+API with three real tools, all implemented in `api/pricing_agent.py`:
+
+| Tool | Purpose |
+|---|---|
+| `what_if_price_change` | Is a proposed price reasonable for given conditions? |
+| `recompute_price` | Recompute the price after changing a supported condition (surge, distance, time, weather, etc.) |
+| `recompute_route_price` | Recompute the price after a destination change, using real Nominatim + OSRM routing |
+
+**Model**: `qwen2.5:7b` is the primary model (chosen specifically for
+reliable tool-calling behavior); if it's unavailable, the assistant falls
+back to `mistral` automatically. A genuine Ollama connection failure is
+reported as a connection error, not silently swallowed.
+
+**Grounding rules enforced in the system prompt**: the model must never
+invent a price, price range, SHAP value, or model metric; every numerical
+claim must trace back to either the real current-prediction context
+supplied every turn, or an actual tool result from this exchange; a tool's
+result is authoritative and must be explained faithfully, never recomputed
+or rounded differently by the model itself.
+
+**Application-level safety, not just prompt instructions**:
+- A demand-related question (e.g. "what if demand increases 20%?") is
+  blocked from executing *any* pricing tool by a deterministic keyword
+  check in the application — this holds even if the model itself tries to
+  substitute `surge_multiplier` for "demand," so a non-compliant model
+  response cannot bypass the rule.
+- Repeated identical tool calls within a single turn are recognized and not
+  re-executed; the cached result (success or failure) is reused instead.
+- The tool-calling loop is capped at `MAX_TOOL_ROUNDS = 4`. If the last
+  round itself produces a usable result, one additional tools-disabled call
+  reads it back to the user instead of discarding it — but this cannot
+  request a new tool, so it cannot extend the round budget.
+- Malformed or missing tool arguments, tool execution failures, and route
+  lookup failures are all caught and turned into a structured
+  `{success: false, error, message}` result — never a stack trace shown to
+  the user, and never presented as a successful price.
+
+**A known limitation, stated honestly**: `qwen2.5:7b`'s tool-calling is not
+100% deterministic. Repeated testing (10 runs per scenario) measured roughly
+90% of legitimate what-if requests reaching a real, correct recomputation on
+the first try; the remainder resolved as a safe non-answer (the assistant
+asking a clarifying question or explaining what it would do) rather than an
+unsafe or fabricated one. Occasionally rephrasing the question resolves it.
+
+---
+
+## Technology Stack
+
+| Layer | Technology |
+|---|---|
+| Frontend | Streamlit (multi-page) |
+| Backend API | FastAPI + Uvicorn |
+| ML | XGBoost, scikit-learn |
+| Explainability | SHAP |
+| GenAI | Ollama (`qwen2.5:7b` primary, `mistral` fallback), real tool calling |
+| Geocoding/Routing | Nominatim + OSRM (OpenStreetMap ecosystem) |
+| Database | Supabase (PostgreSQL) via SQLAlchemy |
+| Map rendering | pydeck |
+| Charts (Analytics) | Plotly |
+
+---
+
+## Project Structure
+
+```
+dynamic-pricing-genai/
+├── api/
+│   ├── main.py                    # FastAPI app: /predict, /whatif, /predict_flight
+│   ├── db.py                      # SQLAlchemy model + log_prediction() / get_recent_predictions()
+│   ├── pricing_service.py         # THE single authoritative pricing/SHAP module (loads models, predicts, explains)
+│   ├── pricing_agent.py           # Tool-orchestration layer for the AI Assistant (what_if_price_change,
+│   │                               #   recompute_price, recompute_route_price) -- the only module allowed
+│   │                               #   to bridge routing and pricing
+│   ├── test_ollama_agent.py       # Standalone prototype: verifies real Ollama tool-calling in isolation
+│   └── test_pricing_agent.py      # Standalone prototype: exercises what_if_price_change via a live Ollama agent
+├── app/
+│   ├── streamlit_app.py           # Main dashboard landing page
+│   ├── route_service.py           # THE single routing module (Nominatim + OSRM)
+│   └── pages/
+│       ├── 1_Price_Prediction.py       # Predict cab/flight prices (manual or route-based distance)
+│       ├── 2_What_If_Simulator.py      # Standalone proposed-price check (no chat)
+│       ├── 3_AI_Assistant.py           # Grounded chat assistant with real tool calling
+│       ├── 4_SHAP_Explanations.py      # Per-prediction SHAP feature contributions
+│       └── 5_Analytics_Dashboard.py    # Historical predictions from Supabase
+├── model/                          # Trained .pkl artifacts (gitignored -- not committed)
+├── data/                           # Training data (gitignored -- not committed)
+├── notebooks/
+│   ├── eda.ipynb                  # Cab EDA + model training + evaluation
+│   └── eda_flights.ipynb          # Flight EDA + model training + evaluation
+├── requirements.txt
+├── .env.example                   # Template for .env (no real credentials)
+└── README.md
+```
+
+---
+
+## Installation & Setup
+
+### Prerequisites
+
+- Python 3.10+ (a virtual environment is recommended)
+- [Ollama](https://ollama.com/) installed, with `qwen2.5:7b` pulled (`mistral` as an optional fallback)
+- A PostgreSQL database (Supabase recommended — a free-tier project provides one)
+- Git
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/parasparte12/dynamic-pricing-genai.git
+cd dynamic-pricing-genai
+
+python -m venv venv
+.\venv\Scripts\Activate.ps1   # Windows
+# source venv/bin/activate    # Mac/Linux
+
+pip install -r requirements.txt
+```
+
+### 2. Configure the database
+
+Create a `.env` file in the project root (never commit this file):
 
 ```env
-# Supabase PostgreSQL connection string
-# Format: postgresql://user:password@host:port/database
-DATABASE_URL=postgresql://postgres:YourPasswordHere@db.example.com:5432/postgres
+DATABASE_URL=<your Supabase PostgreSQL URL>
 ```
 
-### FastAPI Settings
+The `predictions` table is created automatically on first use — no manual
+migration is required. See `.env.example` for the expected format.
 
-In `api/main.py`, adjust:
-- `BASE_DIR`: Project root path (auto-detected)
-- `MODEL_DIR`: Where model files are stored
-- `CORS_ORIGINS`: Allowed origins for requests
+### 3. Pull the Ollama model
 
-### Streamlit Settings
-
-In `app/streamlit_app.py`:
-- Page title and icon
-- Layout (wide/centered)
-- Sidebar width
+```bash
+ollama pull qwen2.5:7b
+# optional fallback:
+ollama pull mistral
+```
 
 ---
 
-## Running Tests
+## Running the Application
 
-### Test FastAPI Endpoints
+Three processes, each in its own terminal:
 
 ```bash
-# Activate venv first
+# Terminal 1 -- Ollama
+ollama serve
+
+# Terminal 2 -- FastAPI backend (http://127.0.0.1:8000)
 python -m uvicorn api.main:app --reload
 
-# In another terminal, run the test
-python api/test_pricing_agent.py
-python api/test_ollama_agent.py
+# Terminal 3 -- Streamlit frontend (http://localhost:8501)
+streamlit run app/streamlit_app.py
 ```
 
-### Test Streamlit Pages
+Open **http://localhost:8501** and navigate the sidebar between Price
+Prediction, What-If Simulator, AI Assistant, SHAP Explanations, and
+Analytics Dashboard.
+
+### Standalone prototype/test scripts
+
+These exercise the Ollama tool-calling layer directly, outside Streamlit —
+useful for confirming Ollama and the tools work before touching the UI.
+Run them as modules from the project root (not as bare file paths, since
+they use the project's real package imports):
 
 ```bash
-streamlit run app/streamlit_app.py
-# Navigate to each page in the sidebar to verify functionality
+python -m api.test_ollama_agent
+python -m api.test_pricing_agent
 ```
 
-### End-to-End Test
+---
 
-1. Start Ollama, FastAPI, and Streamlit (see Quick Start)
-2. Go to http://localhost:8501
-3. Price Prediction page: Try predicting a few prices
-4. What-If Simulator: Test with different proposed prices
-5. AI Assistant: Ask pricing questions
-6. SHAP Explanations: Make a prediction and explore factors
-7. Analytics: Verify database is logging predictions
+## API Reference
+
+All endpoints accept and return JSON.
+
+### `POST /predict` — cab price
+
+```json
+{
+  "distance": 2.5, "surge_multiplier": 1.0, "hour_of_day": 18, "day_of_week": 2,
+  "is_weekend": 0, "is_rush_hour": 1, "is_raining": 0, "cab_type_encoded": 0, "name_encoded": 3
+}
+```
+```json
+{"predicted_price": 23.57, "price_range_low": 20.41, "price_range_high": 28.11}
+```
+
+### `POST /whatif` — proposed-price validation
+
+Same fields as `/predict`, plus `"proposed_price"`.
+
+```json
+{
+  "proposed_price": 60.0, "model_expected_price": 23.57,
+  "expected_range_low": 20.41, "expected_range_high": 28.11,
+  "verdict": "above_expected_range",
+  "message": "The proposed price ($60.00) is above what conditions typically justify ($20.41-$28.11)..."
+}
+```
+
+`verdict` is one of `below_expected_range`, `within_expected_range`,
+`above_expected_range`.
+
+### `POST /predict_flight` — flight price
+
+```json
+{
+  "airline_encoded": 3, "source_city_encoded": 2, "departure_time_encoded": 4,
+  "stops_encoded": 2, "arrival_time_encoded": 0, "destination_city_encoded": 5,
+  "class_encoded": 1, "duration": 2.5, "days_left": 15
+}
+```
+```json
+{"predicted_price": 6316.96, "price_range_low": 3548.82, "price_range_high": 12929.17}
+```
+
+Every successful call to all three endpoints is logged to the Supabase
+`predictions` table via `api/db.py` (endpoint name, input, prediction,
+bounds, model version, timestamp) — logging failures are caught and never
+block the response.
+
+---
+
+## Security Notes
+
+- `.env` is listed in `.gitignore` and must never be committed. `.env.example` contains only a placeholder connection string.
+- Never put a real `DATABASE_URL`, hostname, username, or password into README, code comments, or committed test files.
+- The application never prints or logs the full `DATABASE_URL`, database password, or any credential.
+- The AI Assistant's error handling deliberately avoids surfacing raw Python exceptions, stack traces, internal file paths, or library-internal details to the end user — failures are reported as short, honest, structured messages.
+
+---
+
+## Limitations
+
+- **`qwen2.5:7b` tool-calling is not 100% deterministic.** See [GenAI Assistant & Tool Calling](#genai-assistant--tool-calling) — occasionally a legitimate what-if question needs to be rephrased.
+- **Demand is not a direct model feature**, for either domain. `surge_multiplier` is the closest supported proxy on the cab side, and the application actively refuses to silently treat "demand" as `surge_multiplier`.
+- **Nominatim and OSRM are free, public, best-effort external services** — not production infrastructure, and not "unlimited free." Route results (and therefore route-aware prices) can and do change over time as their underlying map data changes; nothing in this app hardcodes an expected route distance or price.
+- **The cab model was trained on short in-city trips** (~0.1–10 miles); longer routes still produce a price but are an extrapolation outside the training distribution.
+- **This is a project/demo pricing model, not a real commercial fare engine.** It reflects patterns in a fixed historical dataset, not live market conditions, a real carrier's or platform's actual pricing algorithm, or regulatory/business constraints a production system would need.
+- **The price range is model-derived, not a statistically validated confidence interval** — see [ML Models](#ml-models).
+- **Cab and flight feature spaces are entirely different** (9 cab features vs. 9 different flight features) — the two models, their SHAP explainers, and their supported what-if features are not interchangeable, and the AI Assistant is restricted from applying cab-only tools (route/condition recomputation, cab SHAP) to a flight prediction.
+- **Geocoding ambiguity**: a free-text place name can resolve to an unexpected location if it's not unique; there's no disambiguation UI.
+
+---
+
+## Demo Workflow
+
+A suggested walkthrough, in order:
+
+1. State the problem: pricing needs to be explainable and grounded, not a black box or an LLM guess.
+2. Open **Price Prediction**, enter a realistic cab trip, generate a prediction.
+3. Point out the real predicted price and price range came from the XGBoost model, and that the request was logged to Supabase.
+4. Switch to **AI Assistant**, ask *"Why is my price high?"* — show the answer uses the real SHAP contributions for that exact prediction.
+5. Ask *"What if surge multiplier changes from 1.0 to 2.0?"* — show it's a real recomputation, not the LLM doing arithmetic.
+6. Ask *"What if distance increases by 20%?"* — same real-recomputation point, different feature.
+7. Ask *"What if I change my destination to \<somewhere else\>?"* — show the tool chain live: Ollama → real Nominatim geocoding → real OSRM routing → the resulting real distance → the real model → a grounded answer. State plainly that the exact price will reflect whatever the live routing service returns today, not a fixed number.
+8. Ask *"Is $60 reasonable for my current ride?"* — show this uses proposed-price validation, a distinct tool from recomputation.
+9. Ask *"What if demand increases by 20%?"* — show the assistant explains demand isn't a supported feature, and does not silently substitute surge.
+10. Switch to the flight section of **Price Prediction**, generate a flight prediction, and show the assistant correctly recognizes the flight context (no cab-only tools applied to it).
+11. Open **SHAP Explanations** directly and show the same real per-feature contributions in chart form.
+12. Open **Analytics Dashboard** and show historical predictions being tracked from Supabase.
 
 ---
 
 ## Troubleshooting
 
-### Issue: "Could not connect to Ollama"
+### "Could not connect to Ollama"
 
-**Cause**: Ollama server not running or model not installed
-
-**Solution**:
 ```bash
-# Terminal 1: Start Ollama
 ollama serve
-
-# Terminal 2: Pull a model if needed
-ollama pull mistral
-ollama list  # Verify model is available
+ollama list   # confirm qwen2.5:7b (and optionally mistral) are present
 ```
 
-### Issue: "Database connection failed"
+### "Database connection failed" / Analytics Dashboard shows an error
 
-**Cause**: .env file missing, wrong connection string, or Supabase credentials invalid
-
-**Solution**:
-1. Verify .env exists and is not in .gitignore
-2. Check DATABASE_URL format: `postgresql://user:pass@host:5432/db`
-3. Test connection: 
+1. Confirm `.env` exists in the project root and `DATABASE_URL` is set.
+2. Confirm the format: `postgresql://user:password@host:5432/database`.
+3. Test the connection directly:
    ```bash
-   python -c "from api.db import engine; print('Connected!' if engine.connect() else 'Failed')"
+   python -c "from sqlalchemy import inspect; from api.db import engine; print(inspect(engine).get_table_names())"
    ```
 
-### Issue: "Models not found" in FastAPI
+### "Models not found" in FastAPI
 
-**Cause**: Model files missing or path incorrect
+1. Confirm all `.pkl` files exist under `model/` (this directory is gitignored — it must be populated locally, e.g. by running the notebooks).
+2. `api/pricing_service.py` loads models via `Path`-based absolute paths from the project root.
 
-**Solution**:
-1. Verify all `.pkl` files exist in `model/` directory
-2. Check paths in `api/main.py` use absolute paths via `Path` objects
-3. Recreate models if corrupted:
-   ```bash
-   # Run notebook to retrain
-   jupyter notebook notebooks/eda.ipynb
-   ```
+### AI Assistant is slow or times out
 
-### Issue: Streamlit page shows "No data" or "Error fetching predictions"
-
-**Cause**: Database not connected or table schema mismatch
-
-**Solution**:
-1. Verify `DATABASE_URL` in `.env` is correct
-2. Make a prediction via FastAPI to create table if needed
-3. Check table schema: Log in to Supabase, verify `predictions` table exists
-
-### Issue: Ollama timeout in AI Assistant
-
-**Cause**: Model taking too long or timeout too short
-
-**Solution**:
-1. Verify Ollama server is healthy: `ollama list`
-2. Increase timeout in `3_AI_Assistant.py` (currently 30s)
-3. Try a smaller model: `ollama pull mistral:7b` or `ollama pull qwen:7b`
-
----
-
-## Performance Notes
-
-- **Model Prediction**: <100ms per request (XGBoost)
-- **SHAP Computation**: 1-2s per prediction (depends on feature count)
-- **Ollama Response**: 5-15s depending on model size and question complexity
-- **Database Query**: <500ms for recent predictions
-
-For production, consider:
-- Caching SHAP explanations
-- Using ONNX for faster inference
-- Deploying FastAPI to cloud (AWS, Azure, GCP)
-- Using Managed Ollama or switching to API-based LLM
-
----
-
-## Future Enhancements
-
-- [ ] Real-time price updates via WebSocket
-- [ ] Anomaly detection in pricing
-- [ ] A/B testing framework for price experiments
-- [ ] Multi-model ensemble for more robust predictions
-- [ ] Geographic heat mapping of prices
-- [ ] Mobile app for on-the-go predictions
-- [ ] Integration with real ride-hailing platforms
+Ollama response time depends on model size and hardware — `qwen2.5:7b` on
+modest hardware can take several seconds, more when a tool call is
+involved. This is expected; there is no artificial timeout added by this
+project.
 
 ---
 
@@ -667,10 +600,6 @@ This project is open source. See LICENSE file for details.
 
 ## Contact
 
-For questions or issues, please open a GitHub issue or contact the project maintainer.
+For questions or issues, please open a GitHub issue.
 
 **Repository**: https://github.com/parasparte12/dynamic-pricing-genai
-
----
-
-**Last Updated**: December 2024

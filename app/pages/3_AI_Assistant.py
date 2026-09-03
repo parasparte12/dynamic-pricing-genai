@@ -212,6 +212,29 @@ def _is_demand_request(user_message: str) -> bool:
     return "demand" in user_message.lower()
 
 
+_TOOL_PARAM_SCHEMAS = {t["function"]["name"]: t["function"]["parameters"]["properties"] for t in TOOLS}
+
+
+def _scalar_type_mismatches(name: str, args: Dict[str, Any]) -> List[str]:
+    """Deterministic, schema-based pre-flight check: which top-level argument(s) are declared
+    as a plain number/integer in this tool's own schema but were actually passed as a dict.
+
+    Diagnosed live: qwen2.5:7b occasionally puts a {"percent_change": N} spec (which only
+    belongs inside "modifications") into the matching top-level scalar field too, e.g.
+    surge_multiplier={"percent_change": 20} instead of the current numeric value. That reaches
+    pricing_service and fails deep inside pandas/XGBoost dtype validation with a message that
+    names the field but is not phrased in terms either the model or the tool schema uses, so
+    the model often doesn't recover from it. Catching the mismatch here, against the schema
+    already declared in TOOLS, avoids that opaque failure entirely and can point the model at
+    exactly which field and what it should contain instead.
+    """
+    schema = _TOOL_PARAM_SCHEMAS.get(name, {})
+    return [
+        key for key, value in args.items()
+        if schema.get(key, {}).get("type") in ("number", "integer") and isinstance(value, dict)
+    ]
+
+
 def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
     """Run one grounded assistant turn: Ollama decides, real tools execute, Ollama explains.
 
@@ -230,6 +253,10 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
 
     model_in_use = PRIMARY_MODEL
     tools_used: List[str] = []
+    # Keyed by (tool name, canonical JSON of its arguments) -- scoped to this single turn only.
+    # Lets the application recognize an exact repeat of a tool call already executed this turn
+    # (see Part D) without re-running it or fabricating a new result.
+    executed_this_turn: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for _ in range(MAX_TOOL_ROUNDS):
         try:
@@ -286,6 +313,18 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
                     "error": "malformed_tool_arguments",
                     "message": f"Arguments for '{name}' were not a valid object.",
                 }
+            elif (bad_fields := _scalar_type_mismatches(name, args)):
+                tool_result = {
+                    "success": False,
+                    "error": "invalid_argument_type",
+                    "message": (
+                        f"{', '.join(bad_fields)} must be set to the CURRENT numeric value of "
+                        "that feature (e.g. from the CURRENT APPLICATION STATE), not an object "
+                        "like {'percent_change': ...} -- that belongs only inside "
+                        "'modifications'. Call this tool again with the same arguments, but fix "
+                        f"{', '.join(bad_fields)} to a plain number."
+                    ),
+                }
             elif _is_demand_request(user_message):
                 tool_result = {
                     "success": False,
@@ -301,16 +340,78 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
                         "separate, later message."
                     ),
                 }
+            elif (dedup_key := (name, json.dumps(args, sort_keys=True, default=str))) in executed_this_turn:
+                prior_result = executed_this_turn[dedup_key]
+                if prior_result.get("success"):
+                    tool_result = {
+                        **prior_result,
+                        "note": (
+                            "This exact tool call (same tool, identical arguments) was already "
+                            "executed earlier in this turn -- this is that same real result, not "
+                            "a new computation. Do not call this tool again with the same "
+                            "arguments; answer the user's question now using these numbers."
+                        ),
+                    }
+                else:
+                    tool_result = {
+                        **prior_result,
+                        "note": (
+                            "This exact tool call (same tool, identical arguments) already failed "
+                            "with this same error earlier in this turn. Retrying it unchanged will "
+                            "fail again -- either correct the arguments or explain the failure to "
+                            "the user instead of calling it again unchanged."
+                        ),
+                    }
             else:
                 try:
                     tool_result = func(**args)
+                    if isinstance(tool_result, dict) and tool_result.get("success"):
+                        tool_result = {
+                            **tool_result,
+                            "note": (
+                                "This operation completed successfully and this result is "
+                                "authoritative. Answer the user's question now using these exact "
+                                "numbers -- do not recalculate, estimate, or call another tool for "
+                                "this same question."
+                            ),
+                        }
+                    executed_this_turn[dedup_key] = tool_result if isinstance(tool_result, dict) else {"success": False}
+                except TypeError as exc:
+                    tool_result = {
+                        "success": False,
+                        "error": "missing_or_invalid_tool_arguments",
+                        "message": (
+                            f"{exc}. Call '{name}' again with the exact same argument values as "
+                            "this call, plus the missing field(s) named above -- do not change "
+                            "any other argument, and do not add any field that is not already "
+                            "part of this tool's own parameter list."
+                        ),
+                    }
+                    executed_this_turn[dedup_key] = tool_result
                 except Exception as exc:
                     tool_result = {
                         "success": False,
                         "error": "tool_execution_failed",
                         "message": str(exc),
                     }
+                    executed_this_turn[dedup_key] = tool_result
             messages.append({"role": "tool", "content": json.dumps(tool_result, default=str)})
+
+    # The tool-round budget (MAX_TOOL_ROUNDS calls to Ollama, each of which may request a tool)
+    # is exhausted, but the model's last action was still a tool call -- its result was just
+    # appended above and has never actually been shown to the model. Without this, a genuinely
+    # successful result obtained on the final round would be silently discarded and the user
+    # would see only a generic "couldn't reach a final answer" message despite the real answer
+    # already sitting in `messages`. This call cannot request another tool (no `tools` argument
+    # is passed), so it cannot extend the tool-calling budget itself -- it can only read back
+    # what was already gathered.
+    try:
+        response = ollama.chat(model=model_in_use, messages=messages, stream=False)
+        content = response.get("message", {}).get("content")
+        if content:
+            return content, tools_used
+    except Exception:
+        pass
 
     return (
         "I made several tool calls but couldn't reach a final answer. Please try rephrasing your question.",

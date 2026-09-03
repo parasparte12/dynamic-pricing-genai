@@ -40,6 +40,12 @@ TOOL_FUNCTIONS = {
     "recompute_route_price": recompute_route_price_tool,
 }
 
+TOOL_LABELS = {
+    "what_if_price_change": "✅ Checked against the ML model (proposed-price validation)",
+    "recompute_price": "🔁 Recomputed by the ML model (condition change)",
+    "recompute_route_price": "🗺️ Recomputed via real routing (Nominatim/OSRM) + the ML model (destination change)",
+}
+
 SYSTEM_PROMPT = """You are a pricing assistant for a dynamic pricing engine that predicts \
 ride-hailing and airline prices with a trained ML model. Be concise and helpful.
 
@@ -67,6 +73,18 @@ Use the smallest tool that answers the question. Do not call recompute_route_pri
 non-route change, and do not call recompute_price when the user is really asking about a \
 destination change.
 
+DOMAIN RESTRICTIONS:
+what_if_price_change, recompute_price, and recompute_route_price all operate on the cab pricing \
+model only. If the current application state's domain is "flight", do not call any of these \
+tools -- tell the user plainly that condition/what-if recomputation is only available for cab \
+predictions in this system, not flights.
+
+CONVERSATION MEMORY:
+You are not given the prior turns of this conversation -- each message you receive is a fresh, \
+standalone exchange. Rely only on the CURRENT APPLICATION STATE supplied with this message and \
+any tool results returned during this exchange -- never assume or restate a number from an \
+earlier turn that was not just supplied to you again in this message.
+
 USING CURRENT APPLICATION STATE:
 The system supplies you with the actual current prediction (if one exists in this session) as a \
 separate message: real input features, real predicted price, real price range, real route info \
@@ -81,9 +99,12 @@ not call a tool with made-up inputs, and do not answer with your own estimate in
 THERE IS NO "DEMAND" FEATURE:
 The cab model has no direct demand input. If the user asks about "demand" (e.g. "what if demand \
 increases by 20%?"), tell them plainly that the model has no direct demand feature; do not \
-silently treat "demand" as surge_multiplier or fabricate a demand calculation. You may mention \
-that surge_multiplier is the closest real, supported feature, and offer to recompute with that \
-specific feature if the user wants to change it themselves.
+silently treat "demand" as surge_multiplier or fabricate a demand calculation. Do NOT call \
+recompute_price (or any tool) to answer a demand question, even to "demonstrate" what \
+surge_multiplier alone would do -- that is the exact substitution this rule forbids. You may \
+mention, in your text reply only, that surge_multiplier is the closest real, supported feature, \
+and then stop -- only call a tool afterward if the user explicitly asks, in a follow-up message, \
+to change surge_multiplier themselves.
 
 STRICT RULES:
 1. Never invent, guess, or estimate a numerical price, fare, price range, distance, or duration.
@@ -143,18 +164,31 @@ def build_context_message() -> Dict[str, str]:
     lines.append(f"Predicted price: {ctx['predicted_price']}")
     lines.append(f"Price range: {ctx['price_range_low']} - {ctx['price_range_high']}")
 
-    if ctx.get("shap"):
-        shap = ShapContribution(**ctx["shap"])
-        lines.append(f"SHAP baseline (model's expected output before feature effects): {shap.base_value:.2f}")
-        lines.append(
-            "SHAP feature contributions for THIS prediction (signed, ranked by impact -- "
-            "positive increases price relative to baseline, negative decreases it; this is "
-            "per-instance, not global feature importance):"
-        )
-        for c in top_shap_contributions(shap, top_n=len(shap.feature_names)):
-            lines.append(f"  {c['feature']}={c['feature_value']}: {c['shap_value']:+.2f}")
-    else:
+    shap_dict = ctx.get("shap")
+    shap_ok = False
+    if shap_dict:
+        try:
+            shap = ShapContribution(**shap_dict)
+            lines.append(f"SHAP baseline (model's expected output before feature effects): {shap.base_value:.2f}")
+            lines.append(
+                "SHAP feature contributions for THIS prediction (signed, ranked by impact -- "
+                "positive increases price relative to baseline, negative decreases it; this is "
+                "per-instance, not global feature importance):"
+            )
+            for c in top_shap_contributions(shap, top_n=len(shap.feature_names)):
+                lines.append(f"  {c['feature']}={c['feature_value']}: {c['shap_value']:+.2f}")
+            shap_ok = True
+        except Exception:
+            shap_ok = False
+    if not shap_ok:
         lines.append("No SHAP explanation is available for this prediction.")
+
+    if ctx["domain"] == "flight":
+        lines.append(
+            "This is a FLIGHT prediction: it has no route data and no SHAP explanation in this "
+            "system, and the what_if_price_change / recompute_price / recompute_route_price "
+            "tools apply only to cab predictions -- do not call them for this prediction."
+        )
 
     return {"role": "system", "content": "\n".join(lines)}
 
@@ -196,9 +230,11 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
                 except ConnectionError:
                     return "⚠️ Could not connect to Ollama. Make sure it's running with: `ollama serve`", tools_used
                 except Exception as exc2:
-                    return f"❌ Error: {exc2}", tools_used
+                    print(f"[AI Assistant] Ollama error (fallback model): {exc2}")
+                    return "❌ Error: the assistant hit an unexpected problem talking to the model. Please try rephrasing your question.", tools_used
             else:
-                return f"❌ Error: {exc}", tools_used
+                print(f"[AI Assistant] Ollama error: {exc}")
+                return "❌ Error: the assistant hit an unexpected problem talking to the model. Please try rephrasing your question.", tools_used
 
         message = response.get("message", {})
         tool_calls = message.get("tool_calls")
@@ -208,16 +244,33 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
 
         messages.append(message)
         for call in tool_calls:
-            name = call["function"]["name"]
-            args = call["function"]["arguments"]
-            tools_used.append(name)
+            try:
+                name = call["function"]["name"]
+                args = call["function"]["arguments"]
+            except (KeyError, TypeError):
+                messages.append({
+                    "role": "tool",
+                    "content": json.dumps({
+                        "success": False,
+                        "error": "malformed_tool_call",
+                        "message": "The model returned a tool call in an unexpected format.",
+                    }),
+                })
+                continue
 
+            tools_used.append(name)
             func = TOOL_FUNCTIONS.get(name)
             if func is None:
                 tool_result: Any = {
                     "success": False,
                     "error": "unknown_tool",
                     "message": f"'{name}' is not a recognized tool.",
+                }
+            elif not isinstance(args, dict):
+                tool_result = {
+                    "success": False,
+                    "error": "malformed_tool_arguments",
+                    "message": f"Arguments for '{name}' were not a valid object.",
                 }
             else:
                 try:
@@ -261,7 +314,12 @@ if user_input:
             response, tools_used = run_assistant_turn(user_input)
         st.markdown(response)
         if tools_used:
-            st.caption(f"🔧 Used real tool(s): {', '.join(tools_used)}")
+            labels = [TOOL_LABELS.get(t, f"🔧 Used real tool: {t}") for t in tools_used]
+            st.caption(" · ".join(labels))
+        elif st.session_state.get("current_prediction"):
+            st.caption("📊 Answered using the current prediction context -- no additional tool call needed")
+        else:
+            st.caption("💬 General/conceptual answer -- no prediction context or pricing tool was used")
 
     # Add assistant response to history
     st.session_state.messages.append({"role": "assistant", "content": response})
@@ -285,8 +343,12 @@ if OLLAMA_AVAILABLE:
 else:
     st.sidebar.warning("✗ Ollama Python library missing (install: `pip install ollama`)")
 
-if st.session_state.get("current_prediction"):
-    st.sidebar.success("✓ Current prediction available for grounding")
+_current_ctx = st.session_state.get("current_prediction")
+if _current_ctx:
+    if _current_ctx["domain"] == "cab":
+        st.sidebar.success(f"✓ Grounded in current cab prediction: ${_current_ctx['predicted_price']}")
+    else:
+        st.sidebar.success(f"✓ Grounded in current flight prediction: ₹{_current_ctx['predicted_price']}")
 else:
     st.sidebar.info("ℹ️ No current prediction yet -- use the Price Prediction page first")
 

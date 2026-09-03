@@ -60,8 +60,15 @@ Open another PowerShell terminal and run:
 ```powershell
 cd "C:\Users\Paras\Desktop\dynamic-pricing-genai\dynamic-pricing-genai"
 .\venv\Scripts\Activate.ps1
-streamlit run app\streamlit_app.py
+python -m streamlit run app\streamlit_app.py
 ```
+
+Use `python -m streamlit run ...`, not the bare `streamlit run ...` --
+the bare form fails with `ModuleNotFoundError: No module named 'app'` /
+`'api'` because Streamlit's script runner only ever puts `app\` on
+`sys.path`, never the project root that `app.route_service` and
+`api.pricing_service` imports need. `python -m` adds the current
+directory (the project root) to `sys.path` itself.
 
 Open the app in the browser:
 
@@ -103,7 +110,7 @@ python -m uvicorn api.main:app --reload
 # Terminal 3
 cd "C:\Users\Paras\Desktop\dynamic-pricing-genai\dynamic-pricing-genai"
 .\venv\Scripts\Activate.ps1
-streamlit run app\streamlit_app.py
+python -m streamlit run app\streamlit_app.py
 ```
 
 ## 9) Troubleshooting

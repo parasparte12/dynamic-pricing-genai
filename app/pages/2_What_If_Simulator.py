@@ -1,65 +1,102 @@
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import streamlit as st
-import requests
 
-API_BASE = "http://127.0.0.1:8000"
+from api.pricing_service import recompute_cab_price
+from app.ui.cab_inputs import RIDE_TIER_NAMES, render_ride_condition_inputs
+from app.ui.components import error_banner, page_header
+from app.ui.currency import format_cab_delta, format_cab_price
+from app.ui.state import get_current_prediction
+from app.ui.theme import apply_page_config
 
-ride_tier_names = {
-    0: "Black", 1: "Black SUV", 2: "Lux", 3: "Lux Black", 4: "Lux Black XL",
-    5: "Lyft", 6: "Lyft XL", 7: "Shared", 8: "UberPool", 9: "UberX", 10: "UberXL", 11: "WAV"
-}
+apply_page_config("What-If Simulator", "🔀")
+page_header(
+    "🔀", "What-If Simulator",
+    "How does changing ride conditions affect the predicted price? This runs the real "
+    "pricing model twice -- once for the base scenario, once for the modified one -- and "
+    "shows the actual difference. Nothing here is estimated.",
+)
 
-st.title("🔄 What-If Price Simulator")
-st.write("Check whether a proposed price is reasonable given ride conditions.")
+current = get_current_prediction()
+has_base_prediction = bool(current and current.get("domain") == "cab")
 
-col1, col2 = st.columns(2)
+if has_base_prediction:
+    st.success(
+        f"Using your current ride prediction as the base scenario "
+        f"({format_cab_price(current['predicted_price'])}). Adjust the modified scenario below.",
+        icon="✅",
+    )
+    base_defaults = dict(current["input_features"])
+else:
+    st.info(
+        "No current ride prediction found -- set up a base scenario below, or go to "
+        "Price Prediction first to use a real prediction as your starting point.",
+        icon="ℹ️",
+    )
+    base_defaults = {"distance": 2.5}
 
-with col1:
-    wi_distance = st.slider("Distance (miles)", 0.1, 10.0, 2.5, key="wi_distance")
-    wi_surge = st.slider("Surge Multiplier", 1.0, 3.0, 1.0, key="wi_surge")
-    wi_hour = st.slider("Hour of Day", 0, 23, 18, key="wi_hour")
-    wi_day = st.selectbox("Day of Week",
-        options=[0,1,2,3,4,5,6],
-        format_func=lambda x: ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][x],
-        index=4, key="wi_day")
+base_col, modified_col = st.columns(2)
 
-with col2:
-    wi_raining = st.checkbox("Is it raining?", key="wi_raining")
-    wi_cab_type = st.selectbox("Cab Type", options=["Lyft", "Uber"], key="wi_cab_type")
-    wi_tier = st.selectbox("Ride Tier", options=list(ride_tier_names.keys()),
-        format_func=lambda x: ride_tier_names[x], index=6, key="wi_tier")
-    proposed_price = st.number_input("Proposed Price ($)", min_value=1.0, max_value=200.0, value=25.0, step=1.0)
+with base_col:
+    st.markdown("#### Base scenario")
+    base_distance = st.slider(
+        "Distance (miles)", 0.1, 10.0, float(base_defaults.get("distance", 2.5)), key="base_distance",
+    )
+    base_conditions = render_ride_condition_inputs("base", defaults=base_defaults)
+    base_payload = {"distance": base_distance, **base_conditions}
 
-wi_is_weekend = 1 if wi_day in [5, 6] else 0
-wi_is_rush_hour = 1 if wi_hour in [7,8,9,16,17,18] else 0
-wi_cab_type_encoded = 0 if wi_cab_type == "Lyft" else 1
+with modified_col:
+    st.markdown("#### Modified scenario")
+    st.caption("Starts the same as the base scenario -- change what you want to test.")
+    modified_distance = st.slider(
+        "Distance (miles)", 0.1, 10.0, float(base_defaults.get("distance", 2.5)), key="modified_distance",
+    )
+    modified_conditions = render_ride_condition_inputs("modified", defaults=base_defaults)
+    modified_payload = {"distance": modified_distance, **modified_conditions}
 
-if st.button("Check This Price", type="primary"):
-    whatif_payload = {
-        "distance": wi_distance,
-        "surge_multiplier": wi_surge,
-        "hour_of_day": wi_hour,
-        "day_of_week": wi_day,
-        "is_weekend": wi_is_weekend,
-        "is_rush_hour": wi_is_rush_hour,
-        "is_raining": int(wi_raining),
-        "cab_type_encoded": wi_cab_type_encoded,
-        "name_encoded": wi_tier,
-        "proposed_price": proposed_price
+if st.button("Compare Scenarios", type="primary"):
+    modifications = {
+        key: modified_payload[key]
+        for key in base_payload
+        if modified_payload[key] != base_payload[key]
     }
-    try:
-        response = requests.post(f"{API_BASE}/whatif", json=whatif_payload)
-        result = response.json()
 
-        if result['verdict'] == 'within_expected_range':
-            st.success(result['message'])
-        elif result['verdict'] == 'above_expected_range':
-            st.warning(result['message'])
+    if not modifications:
+        st.warning("The modified scenario is identical to the base scenario -- change at least one condition to compare.")
+    else:
+        result = recompute_cab_price(base_payload, modifications)
+
+        if not result.success:
+            error_banner(result.message or "Could not recompute the price for this scenario.")
         else:
-            st.info(result['message'])
+            st.markdown("#### Result")
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Base price", format_cab_price(result.original.predicted_price))
+            r2.metric("Modified price", format_cab_price(result.new.predicted_price))
+            r3.metric(
+                "Difference",
+                format_cab_delta(result.difference),
+                delta=f"{result.percentage_change:+.1f}%" if result.percentage_change is not None else None,
+            )
 
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Proposed Price", f"${result['proposed_price']}")
-        col_b.metric("Model Expected", f"${result['model_expected_price']}")
-        col_c.metric("Expected Range", f"${result['expected_range_low']}-${result['expected_range_high']}")
-    except requests.exceptions.ConnectionError:
-        st.error("Could not connect to the API. Make sure the FastAPI server is running.")
+            st.markdown("**What changed**")
+            for feature, values in result.modifications.items():
+                if feature == "name_encoded":
+                    old_text = RIDE_TIER_NAMES.get(int(values["original_value"]), values["original_value"])
+                    new_text = RIDE_TIER_NAMES.get(int(values["new_value"]), values["new_value"])
+                else:
+                    old_text = f"{values['original_value']:g}"
+                    new_text = f"{values['new_value']:g}"
+                st.write(f"- **{feature}**: {old_text} → {new_text}")
+
+            direction = "increased" if result.difference > 0 else "decreased" if result.difference < 0 else "did not change"
+            st.caption(
+                f"Changing {', '.join(result.modifications.keys())} {direction} the predicted price "
+                f"by {format_cab_delta(abs(result.difference)) if result.difference != 0 else format_cab_delta(0)}"
+                + (f" ({result.percentage_change:+.1f}%)." if result.percentage_change is not None else ".")
+            )

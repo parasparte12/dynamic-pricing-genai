@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import json
 from typing import Any, Dict, List, Tuple
 
@@ -9,6 +16,9 @@ from api.pricing_agent import (
     recompute_route_price_tool, recompute_route_price_tool_definition,
 )
 from api.pricing_service import ShapContribution, top_shap_contributions
+from app.ui.components import page_header
+from app.ui.currency import RUPEE, format_cab_price, format_flight_price, inr_to_usd, usd_to_inr
+from app.ui.theme import apply_page_config
 
 try:
     import ollama
@@ -16,28 +26,112 @@ try:
 except ImportError:
     OLLAMA_AVAILABLE = False
 
-st.set_page_config(page_title="AI Pricing Assistant", page_icon="🤖", layout="wide")
-
-st.title("🤖 AI Pricing Assistant")
-st.markdown("""
-Ask the AI assistant anything about pricing dynamics, what-if scenarios,
-or how various factors affect ride and flight prices.
-""")
+apply_page_config("AI Assistant", "🤖")
+page_header(
+    "🤖", "AI Pricing Assistant",
+    "Ask about pricing dynamics, what-if scenarios, or why a prediction came out the way it "
+    "did. Every number in a response is either your real current prediction or the real "
+    "result of a tool call -- never a guess.",
+)
 
 PRIMARY_MODEL = "qwen2.5:7b"
 FALLBACK_MODEL = "mistral"
 MAX_TOOL_ROUNDS = 4
+
+# ---------------------------------------------------------------------------
+# Currency boundary for the AI Assistant's tools.
+#
+# The cab model and every tool in api.pricing_agent operate in the model's
+# native USD units -- that backend layer is untouched. The UI (this page's
+# context and every tool result the LLM sees) presents cab prices in INR.
+# These thin wrappers are the ONE place that bridges the two: they convert an
+# INR proposed_price DOWN to USD before calling the real tool, and convert
+# the real tool's USD result fields UP to INR before the LLM ever sees them.
+# The LLM only ever reasons in INR and never performs this conversion
+# itself -- it is a deterministic application-level step, same as every
+# other real-tool-result rule already enforced in this file.
+# ---------------------------------------------------------------------------
+
+def _prices_to_inr(pricing_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert the USD price fields of one PricingResult-shaped dict to INR in place."""
+    if not pricing_result:
+        return pricing_result
+    converted = dict(pricing_result)
+    for field in ("predicted_price", "price_range_low", "price_range_high"):
+        if converted.get(field) is not None:
+            converted[field] = round(usd_to_inr(converted[field]), 2)
+    return converted
+
+
+def what_if_price_change_inr(proposed_price, **kwargs):
+    usd_proposed = inr_to_usd(proposed_price)
+    result = what_if_price_change(proposed_price=usd_proposed, **kwargs)
+    if not isinstance(result, dict):
+        return result
+    converted = dict(result)
+    for field in ("proposed_price", "model_expected_price", "expected_range_low", "expected_range_high"):
+        if converted.get(field) is not None:
+            converted[field] = round(usd_to_inr(converted[field]), 2)
+    # The backend's own `message` has "$" hardcoded into it -- replaced with an
+    # INR-denominated message built from the already-converted fields above.
+    if "verdict" in converted:
+        converted["message"] = (
+            f"The proposed price ({RUPEE}{converted.get('proposed_price', 0):.2f}) is "
+            f"{converted['verdict'].replace('_', ' ')} "
+            f"({RUPEE}{converted.get('expected_range_low', 0):.2f}-{RUPEE}{converted.get('expected_range_high', 0):.2f})."
+        )
+    return converted
+
+
+def recompute_price_inr(**kwargs):
+    result = recompute_price(**kwargs)
+    if not isinstance(result, dict):
+        return result
+    converted = dict(result)
+    converted["original"] = _prices_to_inr(converted.get("original"))
+    converted["new"] = _prices_to_inr(converted.get("new"))
+    if converted.get("difference") is not None:
+        converted["difference"] = round(usd_to_inr(converted["difference"]), 2)
+    return converted
+
+
+def recompute_route_price_inr(**kwargs):
+    result = recompute_route_price_tool(**kwargs)
+    if not isinstance(result, dict):
+        return result
+    converted = dict(result)
+    converted["original"] = _prices_to_inr(converted.get("original"))
+    converted["new"] = _prices_to_inr(converted.get("new"))
+    if converted.get("difference") is not None:
+        converted["difference"] = round(usd_to_inr(converted["difference"]), 2)
+    return converted
+
 
 TOOLS = [
     whatif_tool_definition,
     recompute_price_tool_definition,
     recompute_route_price_tool_definition,
 ]
+# proposed_price is now interpreted as Indian Rupees by what_if_price_change_inr above;
+# the schema shown to the model is updated to match, without touching the backend's copy.
+TOOLS[0] = {
+    **whatif_tool_definition,
+    "function": {
+        **whatif_tool_definition["function"],
+        "parameters": {
+            **whatif_tool_definition["function"]["parameters"],
+            "properties": {
+                **whatif_tool_definition["function"]["parameters"]["properties"],
+                "proposed_price": {"type": "number", "description": "The price to evaluate, in Indian Rupees (₹)"},
+            },
+        },
+    },
+}
 
 TOOL_FUNCTIONS = {
-    "what_if_price_change": what_if_price_change,
-    "recompute_price": recompute_price,
-    "recompute_route_price": recompute_route_price_tool,
+    "what_if_price_change": what_if_price_change_inr,
+    "recompute_price": recompute_price_inr,
+    "recompute_route_price": recompute_route_price_inr,
 }
 
 TOOL_LABELS = {
@@ -62,9 +156,15 @@ You do not invent, infer, or approximate SHAP values.
 - You have real tools that call the actual pricing model, the actual SHAP explainer, and the \
 actual routing service. A tool's result is authoritative -- never replace it with your own number.
 
+CURRENCY:
+All cab/ride prices and all flight prices you are shown or that a tool returns are already in \
+Indian Rupees (₹) -- the application converts to/from the model's internal units where needed, \
+before you ever see a number. Always state prices in ₹. Never convert currency yourself, and \
+never assume a number you are given is in dollars.
+
 AVAILABLE TOOLS:
 1. what_if_price_change -- checks whether a PROPOSED price is reasonable for given ride \
-conditions (use for "is $X reasonable?", "is this price fair?").
+conditions (use for "is ₹X reasonable?", "is this price fair?").
 2. recompute_price -- recomputes the price after changing one or more of the model's actual \
 supported ride features (distance, surge_multiplier, hour_of_day, day_of_week, is_weekend, \
 is_rush_hour, is_raining, cab_type_encoded, name_encoded). Use for "what if X changes?" where X \
@@ -127,7 +227,7 @@ directly -- do not answer with your own estimate.
 explanation supplied to you, and (c) general/conceptual pricing information. Never let (c) sound \
 like (a) or (b).
 9. You may explain, in general terms, the direction factors like distance, surge multiplier, \
-time of day, weather, or ride tier tend to push price -- but never attach a specific dollar \
+time of day, weather, or ride tier tend to push price -- but never attach a specific price \
 figure to this explanation unless it was supplied to you.
 10. A tool's returned result is authoritative. Explain it faithfully; never override, round \
 differently, or replace its numbers with your own."""
@@ -163,23 +263,32 @@ def build_context_message() -> Dict[str, str]:
             f"Route distance: {r['distance_miles']} miles ({r['distance_km']} km), "
             f"duration: {r['duration_minutes']} min"
         )
+    # Prices are converted to INR here, once, before the model ever sees them -- for a cab
+    # prediction the model's own raw output is USD and gets converted for display; for a
+    # flight prediction the model's raw output is already INR and passes through unchanged.
+    # The LLM only ever reasons in INR; it never sees a raw USD number and never performs
+    # this conversion itself.
+    is_cab = ctx["domain"] == "cab"
+    to_inr = usd_to_inr if is_cab else (lambda x: x)
+
     lines.append(f"Input features: {json.dumps(ctx['input_features'])}")
-    lines.append(f"Predicted price: {ctx['predicted_price']}")
-    lines.append(f"Price range: {ctx['price_range_low']} - {ctx['price_range_high']}")
+    lines.append(f"Predicted price: {RUPEE}{to_inr(ctx['predicted_price']):.2f}")
+    lines.append(f"Price range: {RUPEE}{to_inr(ctx['price_range_low']):.2f} - {RUPEE}{to_inr(ctx['price_range_high']):.2f}")
+    lines.append("All prices above are in Indian Rupees (₹).")
 
     shap_dict = ctx.get("shap")
     shap_ok = False
     if shap_dict:
         try:
             shap = ShapContribution(**shap_dict)
-            lines.append(f"SHAP baseline (model's expected output before feature effects): {shap.base_value:.2f}")
+            lines.append(f"SHAP baseline (model's expected output before feature effects): {RUPEE}{to_inr(shap.base_value):.2f}")
             lines.append(
-                "SHAP feature contributions for THIS prediction (signed, ranked by impact -- "
-                "positive increases price relative to baseline, negative decreases it; this is "
-                "per-instance, not global feature importance):"
+                "SHAP feature contributions for THIS prediction, in Indian Rupees (signed, ranked "
+                "by impact -- positive increases price relative to baseline, negative decreases "
+                "it; this is per-instance, not global feature importance):"
             )
             for c in top_shap_contributions(shap, top_n=len(shap.feature_names)):
-                lines.append(f"  {c['feature']}={c['feature_value']}: {c['shap_value']:+.2f}")
+                lines.append(f"  {c['feature']}={c['feature_value']}: {RUPEE}{to_inr(c['shap_value']):+.2f}")
             shap_ok = True
         except Exception:
             shap_ok = False
@@ -462,7 +571,7 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("## 💡 Example Questions")
 st.sidebar.markdown("""
 - "How does surge pricing work?"
-- "Is $25 reasonable for a 5 mile ride during rush hour?"
+- "Is ₹2000 reasonable for a 5 mile ride during rush hour?"
 - "What is my current fare?" *(after predicting one)*
 - "Why is my price high?" *(after predicting one)*
 - "What happens if surge multiplier changes to 2x?" *(after predicting one)*
@@ -479,9 +588,9 @@ else:
 _current_ctx = st.session_state.get("current_prediction")
 if _current_ctx:
     if _current_ctx["domain"] == "cab":
-        st.sidebar.success(f"✓ Grounded in current cab prediction: ${_current_ctx['predicted_price']}")
+        st.sidebar.success(f"✓ Grounded in current cab prediction: {format_cab_price(_current_ctx['predicted_price'])}")
     else:
-        st.sidebar.success(f"✓ Grounded in current flight prediction: ₹{_current_ctx['predicted_price']}")
+        st.sidebar.success(f"✓ Grounded in current flight prediction: {format_flight_price(_current_ctx['predicted_price'])}")
 else:
     st.sidebar.info("ℹ️ No current prediction yet -- use the Price Prediction page first")
 

@@ -35,27 +35,37 @@ distance_mode = st.radio(
 )
 is_route_mode = distance_mode.startswith("Route-based")
 
-if is_route_mode:
-    rc1, rc2 = st.columns(2)
-    pickup = rc1.text_input("Pickup location", placeholder="e.g. Andheri, Mumbai", key="ride_pickup")
-    destination = rc2.text_input("Destination", placeholder="e.g. Bandra, Mumbai", key="ride_destination")
-    distance = None
-else:
-    # User-facing unit is km. The slider's bounds/step are chosen in km (0.2-16.1, matching the
-    # old 0.1-10.0mi range) and converted to miles immediately below -- the cab model's `distance`
-    # feature always receives miles, the unit it was trained on (see api/pricing_service.py).
-    distance_km_input = st.slider("Distance (km)", 0.2, 16.1, 4.0, key="ride_manual_distance_km")
-    distance = km_to_miles(distance_km_input)
-    pickup, destination = None, None
+# All trip/condition inputs and the submit button live inside one st.form so Streamlit commits
+# every widget's current value in the SAME rerun that the submit button triggers. Without a form,
+# clicking the button right after typing into a text_input can be processed on a rerun where that
+# text_input's latest keystroke hasn't been committed to session_state yet (a known Streamlit
+# race between a text_input's value-sync and a button's click event) -- the button's rerun then
+# sees pickup/destination as empty even though the field visually shows the typed text, producing
+# a false "please enter both..." warning right next to the correctly-filled fields. st.form is the
+# standard fix: it batches all contained widgets and only reports their values on submit.
+with st.form("ride_pricing_form"):
+    if is_route_mode:
+        rc1, rc2 = st.columns(2)
+        pickup = rc1.text_input("Pickup location", placeholder="e.g. Andheri, Mumbai", key="ride_pickup")
+        destination = rc2.text_input("Destination", placeholder="e.g. Bandra, Mumbai", key="ride_destination")
+        distance = None
+    else:
+        # User-facing unit is km. The slider's bounds/step are chosen in km (0.2-16.1, matching
+        # the old 0.1-10.0mi range) and converted to miles immediately below -- the cab model's
+        # `distance` feature always receives miles, the unit it was trained on (see
+        # api/pricing_service.py).
+        distance_km_input = st.slider("Distance (km)", 0.2, 16.1, 4.0, key="ride_manual_distance_km")
+        distance = km_to_miles(distance_km_input)
+        pickup, destination = None, None
 
-step_label(2, "Ride conditions")
-conditions = render_ride_condition_inputs("ride")
+    step_label(2, "Ride conditions")
+    conditions = render_ride_condition_inputs("ride")
 
-step_label(3, "Predict")
-predict_clicked = st.button(
-    "Calculate Route & Predict Price" if is_route_mode else "Predict Ride Price",
-    type="primary", key="ride_predict_button",
-)
+    step_label(3, "Predict")
+    predict_clicked = st.form_submit_button(
+        "Calculate Route & Predict Price" if is_route_mode else "Predict Ride Price",
+        type="primary", key="ride_predict_button",
+    )
 
 if predict_clicked:
     route_result = None

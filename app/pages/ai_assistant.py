@@ -6,7 +6,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import json
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -18,6 +18,7 @@ from api.pricing_agent import (
 from api.pricing_service import ShapContribution, top_shap_contributions
 from app.ui.components import page_header
 from app.ui.currency import RUPEE, format_cab_price, format_flight_price, inr_to_usd, usd_to_inr
+from app.ui.distance import miles_to_km
 from app.ui.shell import render_top_bar
 from app.ui.theme import inject_css
 
@@ -109,6 +110,22 @@ def what_if_price_change_inr(proposed_price, **kwargs):
     return converted
 
 
+def _distance_modification_to_km(modifications: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Convert a recompute result's `modifications["distance"]` (model-native miles
+    original_value/new_value) to km, so the LLM never has to state -- or convert -- a raw
+    miles figure when explaining a distance change to the user. Every other modified
+    feature is left untouched."""
+    if not isinstance(modifications, dict) or "distance" not in modifications:
+        return modifications
+    converted = dict(modifications)
+    dist = dict(converted["distance"])
+    for field in ("original_value", "new_value"):
+        if dist.get(field) is not None:
+            dist[field] = round(miles_to_km(dist[field]), 2)
+    converted["distance"] = dist
+    return converted
+
+
 def recompute_price_inr(**kwargs):
     result = recompute_price(**kwargs)
     if not isinstance(result, dict):
@@ -118,6 +135,7 @@ def recompute_price_inr(**kwargs):
     converted["new"] = _prices_to_inr(converted.get("new"))
     if converted.get("difference") is not None:
         converted["difference"] = round(usd_to_inr(converted["difference"]), 2)
+    converted["modifications"] = _distance_modification_to_km(converted.get("modifications"))
     return converted
 
 
@@ -130,6 +148,7 @@ def recompute_route_price_inr(**kwargs):
     converted["new"] = _prices_to_inr(converted.get("new"))
     if converted.get("difference") is not None:
         converted["difference"] = round(usd_to_inr(converted["difference"]), 2)
+    converted["modifications"] = _distance_modification_to_km(converted.get("modifications"))
     return converted
 
 
@@ -187,6 +206,16 @@ All cab/ride prices and all flight prices you are shown or that a tool returns a
 Indian Rupees (₹) -- the application converts to/from the model's internal units where needed, \
 before you ever see a number. Always state prices in ₹. Never convert currency yourself, and \
 never assume a number you are given is in dollars.
+
+DISTANCE UNITS:
+The cab model's `distance` feature is internally in miles (the unit it was trained on), and some \
+data you are shown -- application state, tool arguments you must supply, and some tool results -- \
+uses that raw miles value because it is what the model and its tools actually require. But the \
+user-facing unit for ride distance is kilometers. Whenever you state a distance to the user, \
+always use the km value already supplied to you (e.g. "Route distance: X km" or a value already \
+labeled km) and never the miles value, even if both appear in the same message or tool result. \
+Never convert between miles and km yourself -- only ever state a km number that was already given \
+to you as km.
 
 AVAILABLE TOOLS:
 1. what_if_price_change -- checks whether a PROPOSED price is reasonable for given ride \
@@ -286,8 +315,9 @@ def build_context_message() -> Dict[str, str]:
     if ctx.get("route"):
         r = ctx["route"]
         lines.append(
-            f"Route distance: {r['distance_miles']} miles ({r['distance_km']} km), "
-            f"duration: {r['duration_minutes']} min"
+            f"Route distance: {r['distance_km']} km (state this km value to the user; the model's "
+            f"internal distance feature value in miles is {r['distance_miles']}, never state this "
+            f"miles value to the user), duration: {r['duration_minutes']} min"
         )
     # Prices are converted to INR here, once, before the model ever sees them -- for a cab
     # prediction the model's own raw output is USD and gets converted for display; for a
@@ -297,6 +327,19 @@ def build_context_message() -> Dict[str, str]:
     is_cab = ctx["domain"] == "cab"
     to_inr = usd_to_inr if is_cab else (lambda x: x)
 
+    # The raw `distance` value in input_features is model-native miles -- it is left unconverted
+    # here because it must reach any recompute_price/what_if_price_change tool call unchanged
+    # (those tools' `distance` argument is in miles). The line below gives the LLM the km
+    # equivalent explicitly so it never has to convert -- or guess -- the unit when talking to
+    # the user (see the DISTANCE UNITS rule in SYSTEM_PROMPT).
+    _raw_distance = ctx["input_features"].get("distance")
+    if _raw_distance is not None and not ctx.get("route"):
+        lines.append(
+            f"Current trip distance: {miles_to_km(_raw_distance):.1f} km (state this km value to "
+            f"the user; the model's internal distance feature value in miles, {_raw_distance:g}, "
+            "is also present in Input features below for tool calls only -- never state that "
+            "miles value to the user)"
+        )
     lines.append(f"Input features: {json.dumps(ctx['input_features'])}")
     lines.append(f"Predicted price: {RUPEE}{to_inr(ctx['predicted_price']):.2f}")
     lines.append(f"Price range: {RUPEE}{to_inr(ctx['price_range_low']):.2f} - {RUPEE}{to_inr(ctx['price_range_high']):.2f}")
@@ -314,7 +357,10 @@ def build_context_message() -> Dict[str, str]:
                 "it; this is per-instance, not global feature importance):"
             )
             for c in top_shap_contributions(shap, top_n=len(shap.feature_names)):
-                lines.append(f"  {c['feature']}={c['feature_value']}: {RUPEE}{to_inr(c['shap_value']):+.2f}")
+                # distance's feature_value is model-native miles -- shown in km here so the LLM
+                # never has to state (or guess-convert) the raw miles value to the user.
+                display_value = f"{miles_to_km(c['feature_value']):.1f} km" if c["feature"] == "distance" else c["feature_value"]
+                lines.append(f"  {c['feature']}={display_value}: {RUPEE}{to_inr(c['shap_value']):+.2f}")
             shap_ok = True
         except Exception:
             shap_ok = False

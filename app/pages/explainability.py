@@ -11,6 +11,7 @@ import streamlit as st
 
 from app.ui.components import empty_state, error_banner, hero_price_card, page_header
 from app.ui.currency import format_cab_delta, format_cab_price, usd_to_inr
+from app.ui.distance import km_to_miles, miles_to_km
 from app.ui.shell import render_top_bar
 from app.ui.state import get_current_prediction
 from app.ui.theme import COLOR_NEGATIVE, COLOR_POSITIVE, inject_css
@@ -80,7 +81,9 @@ def _render_explanation(payload, predicted_price, shap_dict) -> None:
         if feature == "name_encoded":
             return f"the ride tier ({RIDE_TIER_NAMES.get(int(value), value)})"
         if feature == "distance":
-            return f"the trip distance ({value:g} miles)"
+            # `value` is the model-native miles value from the real SHAP data -- converted to km
+            # for display only, same boundary rule as everywhere else in the cab/ride UI.
+            return f"the trip distance ({miles_to_km(value):.1f} km)"
         if feature == "surge_multiplier":
             return f"the surge multiplier ({value:g}×)"
         if feature == "cab_type_encoded":
@@ -106,8 +109,16 @@ def _render_explanation(payload, predicted_price, shap_dict) -> None:
         table_df = pd.DataFrame(ranked)
         table_df["Contribution"] = table_df["shap_value"].apply(format_cab_delta)
         table_df["Feature"] = table_df["feature"].map(lambda f: _FEATURE_LABELS.get(f, f))
+        # `feature_value` for "distance" is the model-native miles value -- displayed in km here,
+        # same as everywhere else in this file; every other feature's value is shown unconverted.
+        # Formatted as a single string column throughout (not just for distance) so the column
+        # stays one consistent dtype for Streamlit/Arrow instead of mixing numbers and text.
+        table_df["Value"] = table_df.apply(
+            lambda row: f"{miles_to_km(row['feature_value']):.1f} km" if row["feature"] == "distance" else f"{row['feature_value']:g}",
+            axis=1,
+        )
         st.dataframe(
-            table_df[["Feature", "feature_value", "Contribution"]].rename(columns={"feature_value": "Value"}),
+            table_df[["Feature", "Value", "Contribution"]],
             use_container_width=True, hide_index=True,
         )
 
@@ -134,7 +145,8 @@ with tab_current:
 
 with tab_new:
     st.caption("Set up ride conditions and generate a fresh, real prediction with its real SHAP explanation.")
-    distance = st.slider("Distance (miles)", 0.1, 10.0, 2.5, key="shap_distance")
+    distance_km = st.slider("Distance (km)", 0.2, 16.1, 4.0, key="shap_distance_km")
+    distance = km_to_miles(distance_km)  # the model's `distance` feature is always in miles
     conditions = render_ride_condition_inputs("shap")
     payload = {"distance": distance, **conditions}
 

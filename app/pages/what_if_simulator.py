@@ -11,6 +11,7 @@ from api.pricing_service import recompute_cab_price
 from app.ui.cab_inputs import RIDE_TIER_NAMES, render_ride_condition_inputs
 from app.ui.components import error_banner, page_header
 from app.ui.currency import format_cab_delta, format_cab_price
+from app.ui.distance import km_to_miles, miles_to_km
 from app.ui.shell import render_top_bar
 from app.ui.state import get_current_prediction
 from app.ui.theme import inject_css
@@ -49,20 +50,23 @@ else:
 
 current_col, whatif_col = st.columns(2)
 
+# User-facing unit is km; the model's `distance` feature (and every payload built below) is
+# always converted back to miles right after the slider, since that is the unit the cab model
+# was trained on (see api/pricing_service.py) -- this simulator never changes that.
+_default_distance_km = miles_to_km(float(base_defaults.get("distance", 2.5)))
+
 with current_col:
     st.markdown('<div class="app-section-label">Current scenario</div>', unsafe_allow_html=True)
-    base_distance = st.slider(
-        "Distance (miles)", 0.1, 10.0, float(base_defaults.get("distance", 2.5)), key="base_distance",
-    )
+    base_distance_km = st.slider("Distance (km)", 0.2, 16.1, _default_distance_km, key="base_distance_km")
+    base_distance = km_to_miles(base_distance_km)
     base_conditions = render_ride_condition_inputs("base", defaults=base_defaults)
     base_payload = {"distance": base_distance, **base_conditions}
 
 with whatif_col:
     st.markdown('<div class="app-section-label">What-if scenario</div>', unsafe_allow_html=True)
     st.caption("Starts the same as the current scenario -- change what you want to test.")
-    modified_distance = st.slider(
-        "Distance (miles)", 0.1, 10.0, float(base_defaults.get("distance", 2.5)), key="modified_distance",
-    )
+    modified_distance_km = st.slider("Distance (km)", 0.2, 16.1, _default_distance_km, key="modified_distance_km")
+    modified_distance = km_to_miles(modified_distance_km)
     modified_conditions = render_ride_condition_inputs("modified", defaults=base_defaults)
     modified_payload = {"distance": modified_distance, **modified_conditions}
 
@@ -109,6 +113,11 @@ if st.button("Run Simulation", type="primary"):
                     if feature == "name_encoded":
                         old_text = RIDE_TIER_NAMES.get(int(values["original_value"]), values["original_value"])
                         new_text = RIDE_TIER_NAMES.get(int(values["new_value"]), values["new_value"])
+                    elif feature == "distance":
+                        # result.modifications carries the model-native miles values recomputed
+                        # by the real pricing model -- converted to km here for display only.
+                        old_text = f"{miles_to_km(values['original_value']):.1f} km"
+                        new_text = f"{miles_to_km(values['new_value']):.1f} km"
                     else:
                         old_text = f"{values['original_value']:g}"
                         new_text = f"{values['new_value']:g}"

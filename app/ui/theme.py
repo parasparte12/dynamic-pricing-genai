@@ -275,7 +275,16 @@ _CSS = f"""
 """
 
 
-def apply_page_config(title: str, icon: str, layout: str = "wide") -> None:
-    """Call once, first thing, on every page."""
-    st.set_page_config(page_title=f"{title} · Dynamic Pricing Engine", page_icon=icon, layout=layout)
+def configure_app(icon: str = "🚕", layout: str = "wide") -> None:
+    """Call exactly once, from the main entrypoint (app/streamlit_app.py), before
+    st.navigation(...).run(). Streamlit only allows a single set_page_config() call
+    per app run -- individual pages must NOT call this; their own browser-tab title
+    is instead set via st.Page(title=..., icon=...) in the navigation declaration."""
+    st.set_page_config(page_title="Dynamic Pricing Engine", page_icon=icon, layout=layout)
+    inject_css()
+
+
+def inject_css() -> None:
+    """Safe to call from every page (including the main entrypoint) -- unlike
+    set_page_config, injecting the stylesheet again is harmless."""
     st.markdown(_FONT_LINK + _CSS, unsafe_allow_html=True)

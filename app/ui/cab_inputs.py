@@ -16,6 +16,8 @@ from typing import Any, Dict, Optional
 
 import streamlit as st
 
+from app.ui.distance import miles_to_km
+
 RIDE_TIER_NAMES: Dict[int, str] = {
     0: "Black", 1: "Black SUV", 2: "Lux", 3: "Lux Black", 4: "Lux Black XL",
     5: "Lyft", 6: "Lyft XL", 7: "Shared", 8: "UberPool", 9: "UberX", 10: "UberXL", 11: "WAV",
@@ -97,7 +99,10 @@ def describe_conditions(payload: Dict[str, Any]) -> str:
     tier = RIDE_TIER_NAMES.get(payload.get("name_encoded"), "Unknown tier")
     day = DAY_NAMES[payload["day_of_week"]] if "day_of_week" in payload else ""
     rain = " · Raining" if payload.get("is_raining") else ""
+    # `distance` in payload is the model-native miles value -- shown in km here, the user-facing
+    # unit for cab/ride-hailing (see app/ui/distance.py).
+    distance_text = f"{miles_to_km(payload['distance']):.1f} km" if payload.get("distance") is not None else "?"
     return (
-        f"{payload.get('distance', '?')} mi · {cab_type} {tier} · "
+        f"{distance_text} · {cab_type} {tier} · "
         f"{day} {payload.get('hour_of_day', '?')}:00 · surge {payload.get('surge_multiplier', '?')}x{rain}"
     )

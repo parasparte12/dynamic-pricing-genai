@@ -31,6 +31,20 @@ flights_model_lower = joblib.load(MODEL_DIR / 'flights_price_model_lower.pkl')
 flights_model_upper = joblib.load(MODEL_DIR / 'flights_price_model_upper.pkl')
 flights_feature_cols = joblib.load(MODEL_DIR / 'flights_feature_cols.pkl')
 
+# The cab model is an XGBoost tree ensemble trained on data/cab_cleaned_features.csv, whose
+# `distance` column ranges from 0.02 to 7.86 miles (short in-city trips only -- verified by
+# direct inspection of the training data). Like any tree-based model, it cannot extrapolate
+# beyond the split thresholds it saw during training: once `distance` exceeds every split point
+# in the trees (empirically, right around this max), every larger distance falls into the same
+# terminal leaf and the model returns an IDENTICAL predicted price no matter how much larger the
+# distance gets -- this is not a caching or pipeline bug, it is inherent to how decision trees
+# generalize. Two different destinations that both produce a route distance past this threshold
+# will therefore legitimately receive the same price. The UI surfaces this limitation rather than
+# silently returning a number that looks precise but isn't backed by any training signal at that
+# distance. Fixing it for real would require retraining on a dataset that includes longer,
+# intercity trips -- this constant does not attempt to paper over that with a fake adjustment.
+CAB_MODEL_TRAINING_MAX_DISTANCE_MILES = 7.86
+
 
 def prepare_cab_features(payload: Dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame([payload])[cab_feature_cols]

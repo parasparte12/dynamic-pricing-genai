@@ -6,7 +6,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import json
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -18,25 +18,52 @@ from api.pricing_agent import (
 from api.pricing_service import ShapContribution, top_shap_contributions
 from app.ui.components import page_header
 from app.ui.currency import RUPEE, format_cab_price, format_flight_price, inr_to_usd, usd_to_inr
-from app.ui.theme import apply_page_config
+from app.ui.distance import miles_to_km
+from app.ui.shell import render_top_bar
+from app.ui.theme import inject_css
 
 try:
+    import httpx
     import ollama
+
     OLLAMA_AVAILABLE = True
+    # The module-level ollama.chat() convenience function talks through an internal client
+    # created with timeout=None (verified in ollama/_client.py) -- an unbounded httpx read
+    # timeout, so a slow/hung Ollama response (e.g. the model was idle and has to reload into
+    # memory) never raises, it just hangs. Streamlit's "Thinking..." spinner then spins forever
+    # with no error surfaced, which looks exactly like "the assistant stopped working" and is
+    # what typically drives a user to refresh the browser -- which starts a brand-new Streamlit
+    # session and wipes st.session_state.messages, making it look like only the first message
+    # ever worked. A real client with a bounded timeout turns that silent hang into a clean,
+    # visible error instead.
+    _ollama_client = ollama.Client(timeout=120.0)
 except ImportError:
     OLLAMA_AVAILABLE = False
 
-apply_page_config("AI Assistant", "🤖")
+# How long Ollama keeps the model loaded in memory after this call. The library default is ~5
+# minutes; a short conversation with a few seconds between messages can easily exceed that,
+# forcing a slow cold reload (and, without the timeout fix above, an unbounded hang) on a later
+# message in the same chat. 30 minutes comfortably covers a normal chat session.
+OLLAMA_KEEP_ALIVE = "30m"
+
+inject_css()
+render_top_bar()
 page_header(
     "🤖", "AI Pricing Assistant",
-    "Ask about pricing dynamics, what-if scenarios, or why a prediction came out the way it "
-    "did. Every number in a response is either your real current prediction or the real "
-    "result of a tool call -- never a guess.",
+    "Ask questions about pricing, predictions, and scenarios. Every number in a response is "
+    "either your real current prediction or the real result of a tool call -- never a guess.",
 )
 
 PRIMARY_MODEL = "qwen2.5:7b"
 FALLBACK_MODEL = "mistral"
 MAX_TOOL_ROUNDS = 4
+
+SUGGESTED_PROMPTS = [
+    "Why is this fare high?",
+    "What happens if surge increases?",
+    "Which factor has the biggest impact?",
+    "Is this proposed price reasonable?",
+]
 
 # ---------------------------------------------------------------------------
 # Currency boundary for the AI Assistant's tools.
@@ -83,6 +110,22 @@ def what_if_price_change_inr(proposed_price, **kwargs):
     return converted
 
 
+def _distance_modification_to_km(modifications: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Convert a recompute result's `modifications["distance"]` (model-native miles
+    original_value/new_value) to km, so the LLM never has to state -- or convert -- a raw
+    miles figure when explaining a distance change to the user. Every other modified
+    feature is left untouched."""
+    if not isinstance(modifications, dict) or "distance" not in modifications:
+        return modifications
+    converted = dict(modifications)
+    dist = dict(converted["distance"])
+    for field in ("original_value", "new_value"):
+        if dist.get(field) is not None:
+            dist[field] = round(miles_to_km(dist[field]), 2)
+    converted["distance"] = dist
+    return converted
+
+
 def recompute_price_inr(**kwargs):
     result = recompute_price(**kwargs)
     if not isinstance(result, dict):
@@ -92,6 +135,7 @@ def recompute_price_inr(**kwargs):
     converted["new"] = _prices_to_inr(converted.get("new"))
     if converted.get("difference") is not None:
         converted["difference"] = round(usd_to_inr(converted["difference"]), 2)
+    converted["modifications"] = _distance_modification_to_km(converted.get("modifications"))
     return converted
 
 
@@ -104,6 +148,7 @@ def recompute_route_price_inr(**kwargs):
     converted["new"] = _prices_to_inr(converted.get("new"))
     if converted.get("difference") is not None:
         converted["difference"] = round(usd_to_inr(converted["difference"]), 2)
+    converted["modifications"] = _distance_modification_to_km(converted.get("modifications"))
     return converted
 
 
@@ -161,6 +206,16 @@ All cab/ride prices and all flight prices you are shown or that a tool returns a
 Indian Rupees (₹) -- the application converts to/from the model's internal units where needed, \
 before you ever see a number. Always state prices in ₹. Never convert currency yourself, and \
 never assume a number you are given is in dollars.
+
+DISTANCE UNITS:
+The cab model's `distance` feature is internally in miles (the unit it was trained on), and some \
+data you are shown -- application state, tool arguments you must supply, and some tool results -- \
+uses that raw miles value because it is what the model and its tools actually require. But the \
+user-facing unit for ride distance is kilometers. Whenever you state a distance to the user, \
+always use the km value already supplied to you (e.g. "Route distance: X km" or a value already \
+labeled km) and never the miles value, even if both appear in the same message or tool result. \
+Never convert between miles and km yourself -- only ever state a km number that was already given \
+to you as km.
 
 AVAILABLE TOOLS:
 1. what_if_price_change -- checks whether a PROPOSED price is reasonable for given ride \
@@ -236,8 +291,8 @@ differently, or replace its numbers with your own."""
 def build_context_message() -> Dict[str, str]:
     """Real application state for the current session, or an explicit 'none available' note.
 
-    Never fabricated: this reads exactly what app/pages/1_Price_Prediction.py stored in
-    st.session_state after an actual /predict call, plus real SHAP data if it was computed.
+    Never fabricated: this reads exactly what app/pages/ride_pricing.py or flight_pricing.py
+    stored in st.session_state after an actual prediction, plus real SHAP data if computed.
     """
     ctx = st.session_state.get("current_prediction")
     if not ctx:
@@ -260,8 +315,9 @@ def build_context_message() -> Dict[str, str]:
     if ctx.get("route"):
         r = ctx["route"]
         lines.append(
-            f"Route distance: {r['distance_miles']} miles ({r['distance_km']} km), "
-            f"duration: {r['duration_minutes']} min"
+            f"Route distance: {r['distance_km']} km (state this km value to the user; the model's "
+            f"internal distance feature value in miles is {r['distance_miles']}, never state this "
+            f"miles value to the user), duration: {r['duration_minutes']} min"
         )
     # Prices are converted to INR here, once, before the model ever sees them -- for a cab
     # prediction the model's own raw output is USD and gets converted for display; for a
@@ -271,6 +327,19 @@ def build_context_message() -> Dict[str, str]:
     is_cab = ctx["domain"] == "cab"
     to_inr = usd_to_inr if is_cab else (lambda x: x)
 
+    # The raw `distance` value in input_features is model-native miles -- it is left unconverted
+    # here because it must reach any recompute_price/what_if_price_change tool call unchanged
+    # (those tools' `distance` argument is in miles). The line below gives the LLM the km
+    # equivalent explicitly so it never has to convert -- or guess -- the unit when talking to
+    # the user (see the DISTANCE UNITS rule in SYSTEM_PROMPT).
+    _raw_distance = ctx["input_features"].get("distance")
+    if _raw_distance is not None and not ctx.get("route"):
+        lines.append(
+            f"Current trip distance: {miles_to_km(_raw_distance):.1f} km (state this km value to "
+            f"the user; the model's internal distance feature value in miles, {_raw_distance:g}, "
+            "is also present in Input features below for tool calls only -- never state that "
+            "miles value to the user)"
+        )
     lines.append(f"Input features: {json.dumps(ctx['input_features'])}")
     lines.append(f"Predicted price: {RUPEE}{to_inr(ctx['predicted_price']):.2f}")
     lines.append(f"Price range: {RUPEE}{to_inr(ctx['price_range_low']):.2f} - {RUPEE}{to_inr(ctx['price_range_high']):.2f}")
@@ -288,7 +357,10 @@ def build_context_message() -> Dict[str, str]:
                 "it; this is per-instance, not global feature importance):"
             )
             for c in top_shap_contributions(shap, top_n=len(shap.feature_names)):
-                lines.append(f"  {c['feature']}={c['feature_value']}: {RUPEE}{to_inr(c['shap_value']):+.2f}")
+                # distance's feature_value is model-native miles -- shown in km here so the LLM
+                # never has to state (or guess-convert) the raw miles value to the user.
+                display_value = f"{miles_to_km(c['feature_value']):.1f} km" if c["feature"] == "distance" else c["feature_value"]
+                lines.append(f"  {c['feature']}={display_value}: {RUPEE}{to_inr(c['shap_value']):+.2f}")
             shap_ok = True
         except Exception:
             shap_ok = False
@@ -367,21 +439,35 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
     tools_used: List[str] = []
     # Keyed by (tool name, canonical JSON of its arguments) -- scoped to this single turn only.
     # Lets the application recognize an exact repeat of a tool call already executed this turn
-    # (see Part D) without re-running it or fabricating a new result.
+    # without re-running it or fabricating a new result.
     executed_this_turn: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     for _ in range(MAX_TOOL_ROUNDS):
         try:
-            response = ollama.chat(model=model_in_use, messages=messages, tools=TOOLS, stream=False)
+            response = _ollama_client.chat(
+                model=model_in_use, messages=messages, tools=TOOLS, stream=False, keep_alive=OLLAMA_KEEP_ALIVE,
+            )
         except ConnectionError:
             return "⚠️ Could not connect to Ollama. Make sure it's running with: `ollama serve`", tools_used
+        except httpx.TimeoutException:
+            return (
+                "⏱️ The AI model took too long to respond (it may still be loading into memory "
+                "after being idle). Please try sending your message again.", tools_used,
+            )
         except Exception as exc:
             if model_in_use == PRIMARY_MODEL and _is_model_missing_error(exc):
                 model_in_use = FALLBACK_MODEL
                 try:
-                    response = ollama.chat(model=model_in_use, messages=messages, tools=TOOLS, stream=False)
+                    response = _ollama_client.chat(
+                        model=model_in_use, messages=messages, tools=TOOLS, stream=False, keep_alive=OLLAMA_KEEP_ALIVE,
+                    )
                 except ConnectionError:
                     return "⚠️ Could not connect to Ollama. Make sure it's running with: `ollama serve`", tools_used
+                except httpx.TimeoutException:
+                    return (
+                        "⏱️ The AI model took too long to respond (it may still be loading into "
+                        "memory after being idle). Please try sending your message again.", tools_used,
+                    )
                 except Exception as exc2:
                     print(f"[AI Assistant] Ollama error (fallback model): {exc2}")
                     return "❌ Error: the assistant hit an unexpected problem talking to the model. Please try rephrasing your question.", tools_used
@@ -518,7 +604,9 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
     # is passed), so it cannot extend the tool-calling budget itself -- it can only read back
     # what was already gathered.
     try:
-        response = ollama.chat(model=model_in_use, messages=messages, stream=False)
+        response = _ollama_client.chat(
+            model=model_in_use, messages=messages, stream=False, keep_alive=OLLAMA_KEEP_ALIVE,
+        )
         content = response.get("message", {}).get("content")
         if content:
             return content, tools_used
@@ -535,13 +623,30 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if st.session_state.messages:
+    _header_cols = st.columns([5, 1])
+    with _header_cols[1]:
+        if st.button("🆕 New Chat", key="ai_new_chat", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
+
 # Display chat history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
+# Suggested prompts -- only shown before the conversation starts, to save space afterward
+pending_prompt = None
+if not st.session_state.messages:
+    st.markdown('<div class="app-section-label">Suggested questions</div>', unsafe_allow_html=True)
+    chip_cols = st.columns(len(SUGGESTED_PROMPTS))
+    for col, prompt in zip(chip_cols, SUGGESTED_PROMPTS):
+        if col.button(prompt, key=f"suggested_{prompt}", use_container_width=True):
+            pending_prompt = prompt
+
 # Chat input
-user_input = st.chat_input("Ask about pricing factors, what-if scenarios, or pricing strategy...")
+typed_input = st.chat_input("Ask about pricing factors, what-if scenarios, or pricing strategy...")
+user_input = typed_input or pending_prompt
 
 if user_input:
     # Add user message to history
@@ -566,18 +671,7 @@ if user_input:
     # Add assistant response to history
     st.session_state.messages.append({"role": "assistant", "content": response})
 
-# Sidebar with helpful examples
-st.sidebar.markdown("---")
-st.sidebar.markdown("## 💡 Example Questions")
-st.sidebar.markdown("""
-- "How does surge pricing work?"
-- "Is ₹2000 reasonable for a 5 mile ride during rush hour?"
-- "What is my current fare?" *(after predicting one)*
-- "Why is my price high?" *(after predicting one)*
-- "What happens if surge multiplier changes to 2x?" *(after predicting one)*
-- "What happens if I change my destination?" *(after a route-based prediction)*
-""")
-
+# Sidebar
 st.sidebar.markdown("---")
 st.sidebar.markdown("## ✅ Setup Status")
 if OLLAMA_AVAILABLE:
@@ -592,7 +686,7 @@ if _current_ctx:
     else:
         st.sidebar.success(f"✓ Grounded in current flight prediction: {format_flight_price(_current_ctx['predicted_price'])}")
 else:
-    st.sidebar.info("ℹ️ No current prediction yet -- use the Price Prediction page first")
+    st.sidebar.info("ℹ️ No current prediction yet -- predict a ride or flight first")
 
 st.sidebar.markdown("""
 **Requirements:**

@@ -1,0 +1,17 @@
+# Dark premium theme for the Dynamic Pricing Engine.
+#
+# This retheme's every native Streamlit widget (buttons, sliders, inputs,
+# tabs, metrics) automatically -- it's the foundation the rest of the
+# design system (app/ui/theme.py's CSS) builds on top of, not a substitute
+# for it. Frontend-only: has no effect on any backend/model behavior.
+
+[theme]
+base = "dark"
+primaryColor = "#6366F1"
+backgroundColor = "#0B0E14"
+secondaryBackgroundColor = "#131722"
+textColor = "#E6E8EE"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"

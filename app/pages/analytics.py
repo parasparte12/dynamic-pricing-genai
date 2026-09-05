@@ -11,13 +11,26 @@ import streamlit as st
 
 from app.ui.components import empty_state, error_banner, page_header
 from app.ui.currency import format_cab_price, format_flight_price, usd_to_inr
-from app.ui.theme import COLOR_PRIMARY, apply_page_config
+from app.ui.shell import render_top_bar
+from app.ui.theme import COLOR_ACCENT, COLOR_PRIMARY, inject_css
 
-apply_page_config("Analytics", "📈")
+_CHART_COLORS = [COLOR_PRIMARY, COLOR_ACCENT, "#818CF8", "#34D399", "#F59E0B"]
+
+
+def _themed(fig):
+    fig.update_layout(
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        font_color="#E6E8EE", margin=dict(t=30),
+    )
+    return fig
+
+
+inject_css()
+render_top_bar()
 page_header(
-    "📈", "Analytics",
-    "Real historical predictions logged to the database by this application -- ride and "
-    "flight domains are always kept separate since they use different models and currencies.",
+    "📊", "Analytics",
+    "Real historical predictions logged to the database -- ride and flight domains are always "
+    "kept separate, since they use different models and currencies.",
 )
 
 try:
@@ -27,13 +40,11 @@ except Exception:
     rows = None
 
 if rows is None:
-    error_banner(
-        "Prediction history is unavailable -- the database is not configured or could not be reached."
-    )
+    error_banner("Prediction history is unavailable -- the database is not configured or could not be reached.")
     st.stop()
 
 if not rows:
-    empty_state("No historical prediction data available yet. Make a prediction to see analytics here.")
+    empty_state("No historical data available yet. Make a prediction to see analytics here.")
     st.stop()
 
 df = pd.DataFrame(rows)
@@ -42,20 +53,26 @@ df["created_at"] = pd.to_datetime(df["created_at"])
 ride_df = df[df["endpoint"].isin(["predict", "whatif"])].copy()
 flight_df = df[df["endpoint"] == "predict_flight"].copy()
 
-st.markdown("#### Endpoint usage")
+st.markdown('<div class="app-section-label">Prediction overview</div>', unsafe_allow_html=True)
+o1, o2, o3 = st.columns(3)
+o1.metric("Total predictions", len(df))
+o2.metric("Ride predictions", len(ride_df))
+o3.metric("Flight predictions", len(flight_df))
+
+st.markdown('<div class="app-section-label">Endpoint usage</div>', unsafe_allow_html=True)
 endpoint_counts = df["endpoint"].value_counts().reset_index()
 endpoint_counts.columns = ["endpoint", "count"]
 fig_usage = px.bar(
     endpoint_counts, x="endpoint", y="count", color="endpoint",
     labels={"endpoint": "Endpoint", "count": "Predictions logged"},
-    color_discrete_sequence=px.colors.qualitative.Set2,
+    color_discrete_sequence=_CHART_COLORS,
 )
 fig_usage.update_layout(showlegend=False)
-st.plotly_chart(fig_usage, use_container_width=True)
+st.plotly_chart(_themed(fig_usage), use_container_width=True)
 
 st.divider()
 
-ride_tab, flight_tab, recent_tab = st.tabs(["🚗 Ride Analytics", "✈️ Flight Analytics", "🕘 Recent Predictions"])
+ride_tab, flight_tab, recent_tab = st.tabs(["🚗 Ride Pricing Trends", "✈️ Flight Pricing Trends", "🕘 Recent Predictions"])
 
 with ride_tab:
     if ride_df.empty:
@@ -77,10 +94,9 @@ with ride_tab:
             fig_trend = px.line(
                 trend_df, x="created_at", y="price_inr", markers=True,
                 labels={"created_at": "Time", "price_inr": "Price (₹)"},
-                title="Ride price trend over time",
             )
             fig_trend.update_traces(line_color=COLOR_PRIMARY)
-            st.plotly_chart(fig_trend, use_container_width=True)
+            st.plotly_chart(_themed(fig_trend), use_container_width=True)
 
 with flight_tab:
     if flight_df.empty:
@@ -100,9 +116,9 @@ with flight_tab:
             fig_trend = px.line(
                 trend_df, x="created_at", y="prediction", markers=True,
                 labels={"created_at": "Time", "prediction": "Price (₹)"},
-                title="Flight price trend over time",
             )
-            st.plotly_chart(fig_trend, use_container_width=True)
+            fig_trend.update_traces(line_color=COLOR_ACCENT)
+            st.plotly_chart(_themed(fig_trend), use_container_width=True)
 
 with recent_tab:
     display_df = df.sort_values("created_at", ascending=False).head(100).copy()

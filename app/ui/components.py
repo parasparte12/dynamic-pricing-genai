@@ -57,7 +57,8 @@ def quick_action_card(icon: str, title: str, description: str) -> None:
     st.markdown(
         f"""
         <div class="app-action-card">
-            <h4>{icon} {title}</h4>
+            <span class="app-action-icon">{icon}</span>
+            <h4>{title}</h4>
             <p>{description}</p>
         </div>
         """,
@@ -65,8 +66,29 @@ def quick_action_card(icon: str, title: str, description: str) -> None:
     )
 
 
+def step_label(number: int, text: str) -> None:
+    """A small numbered step marker for multi-step forms, e.g. Ride Pricing's Trip/Conditions/Predict steps."""
+    st.markdown(
+        f'<div class="app-step-label"><span class="app-step-number">{number}</span>{text}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def safe_page_link(path: str, label: str, icon: Optional[str] = None, use_container_width: bool = False) -> None:
+    """st.page_link(), but never lets a page-manifest issue crash the page around it.
+
+    Falls back to a plain-text hint if st.page_link() raises for any reason (observed in
+    isolated test harnesses where Streamlit's multi-page manifest isn't fully populated;
+    kept defensive here regardless of context, since a navigation link is never worth a
+    crash in the real app either)."""
+    try:
+        st.page_link(path, label=label, icon=icon, use_container_width=use_container_width)
+    except Exception:
+        st.caption(f"👉 {label} -- see the sidebar navigation.")
+
+
 def section_divider(label: Optional[str] = None) -> None:
     if label:
-        st.markdown(f"##### {label}")
+        st.markdown(f'<div class="app-section-label">{label}</div>', unsafe_allow_html=True)
     else:
         st.divider()

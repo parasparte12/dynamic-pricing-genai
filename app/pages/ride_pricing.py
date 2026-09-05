@@ -9,7 +9,7 @@ import pandas as pd
 import pydeck as pdk
 import streamlit as st
 
-from api.pricing_service import explain_cab_price
+from api.pricing_service import CAB_MODEL_TRAINING_MAX_DISTANCE_MILES, explain_cab_price
 from app.route_service import RouteError, get_route_for_locations
 from app.ui.api_client import ApiError, predict_cab
 from app.ui.cab_inputs import RIDE_TIER_NAMES, describe_conditions, render_ride_condition_inputs
@@ -110,19 +110,28 @@ if predict_clicked:
             info_cols[3].metric("Ride tier", RIDE_TIER_NAMES.get(conditions["name_encoded"], "—"))
             st.caption(f"Conditions: {describe_conditions(payload)}")
 
+            # The model (an XGBoost tree ensemble) was trained only on distances up to
+            # CAB_MODEL_TRAINING_MAX_DISTANCE_MILES (see api/pricing_service.py). Trees cannot
+            # extrapolate past the split points they saw during training, so any distance beyond
+            # this -- whether from a long route or a manually entered value -- lands in the same
+            # terminal leaf as every other out-of-range distance and returns an identical price.
+            # This applies in both route and manual-distance mode, so the check is unconditional.
+            if distance > CAB_MODEL_TRAINING_MAX_DISTANCE_MILES:
+                st.info(
+                    f"This trip ({distance:.1f} mi) is longer than any trip the model was trained "
+                    f"on (short in-city trips up to {CAB_MODEL_TRAINING_MAX_DISTANCE_MILES:.1f} mi). "
+                    "Tree-based models like this one cannot extrapolate past the distances they were "
+                    "trained on, so the price above is the same price the model would give for any "
+                    "similarly long trip -- it will not keep changing as the distance grows further. "
+                    "This is a genuine limitation of the training data, not a display bug."
+                )
+
             safe_page_link("pages/explainability.py", "Understand this prediction", icon="🧠")
 
             if route_result is not None:
                 st.write("")
                 st.markdown('<div class="app-section-label">Route</div>', unsafe_allow_html=True)
                 st.caption(f"📍 {route_result.origin}  →  🏁 {route_result.destination}")
-
-                if route_result.distance_miles > 10:
-                    st.info(
-                        "This route is longer than the trip distances the model was trained on "
-                        "(short in-city trips up to ~10 miles). The price is an extrapolation and "
-                        "may be less reliable for long intercity routes."
-                    )
 
                 path_coords = [[lon, lat] for lat, lon in route_result.route_geometry]
                 origin_lat, origin_lon = route_result.origin_coordinates

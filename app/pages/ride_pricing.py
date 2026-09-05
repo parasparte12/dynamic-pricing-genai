@@ -15,6 +15,7 @@ from app.ui.api_client import ApiError, predict_cab
 from app.ui.cab_inputs import RIDE_TIER_NAMES, describe_conditions, render_ride_condition_inputs
 from app.ui.components import error_banner, hero_price_card, page_header, safe_page_link, step_label
 from app.ui.currency import format_cab_price
+from app.ui.distance import format_distance_km, km_to_miles
 from app.ui.shell import render_top_bar
 from app.ui.state import set_current_prediction
 from app.ui.theme import inject_css
@@ -40,7 +41,11 @@ if is_route_mode:
     destination = rc2.text_input("Destination", placeholder="e.g. Bandra, Mumbai", key="ride_destination")
     distance = None
 else:
-    distance = st.slider("Distance (miles)", 0.1, 10.0, 2.5, key="ride_manual_distance")
+    # User-facing unit is km. The slider's bounds/step are chosen in km (0.2-16.1, matching the
+    # old 0.1-10.0mi range) and converted to miles immediately below -- the cab model's `distance`
+    # feature always receives miles, the unit it was trained on (see api/pricing_service.py).
+    distance_km_input = st.slider("Distance (km)", 0.2, 16.1, 4.0, key="ride_manual_distance_km")
+    distance = km_to_miles(distance_km_input)
     pickup, destination = None, None
 
 step_label(2, "Ride conditions")
@@ -103,7 +108,9 @@ if predict_clicked:
             )
 
             info_cols = st.columns(4)
-            info_cols[0].metric("Distance", f"{distance:.1f} mi")
+            # `distance` is always model-native miles here (from the route or from the km->miles
+            # conversion above); format_distance_km converts it to km for display only.
+            info_cols[0].metric("Distance", format_distance_km(distance))
             if route_result is not None:
                 info_cols[1].metric("Duration", f"{route_result.duration_minutes:.0f} min")
             info_cols[2].metric("Surge", f"{conditions['surge_multiplier']:.1f}×")
@@ -118,8 +125,8 @@ if predict_clicked:
             # This applies in both route and manual-distance mode, so the check is unconditional.
             if distance > CAB_MODEL_TRAINING_MAX_DISTANCE_MILES:
                 st.info(
-                    f"This trip ({distance:.1f} mi) is longer than any trip the model was trained "
-                    f"on (short in-city trips up to {CAB_MODEL_TRAINING_MAX_DISTANCE_MILES:.1f} mi). "
+                    f"This trip ({format_distance_km(distance)}) is longer than any trip the model "
+                    f"was trained on (short in-city trips up to {format_distance_km(CAB_MODEL_TRAINING_MAX_DISTANCE_MILES)}). "
                     "Tree-based models like this one cannot extrapolate past the distances they were "
                     "trained on, so the price above is the same price the model would give for any "
                     "similarly long trip -- it will not keep changing as the distance grows further. "

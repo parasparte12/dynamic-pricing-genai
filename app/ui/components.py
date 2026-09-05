@@ -57,7 +57,8 @@ def quick_action_card(icon: str, title: str, description: str) -> None:
     st.markdown(
         f"""
         <div class="app-action-card">
-            <h4>{icon} {title}</h4>
+            <span class="app-action-icon">{icon}</span>
+            <h4>{title}</h4>
             <p>{description}</p>
         </div>
         """,
@@ -65,8 +66,16 @@ def quick_action_card(icon: str, title: str, description: str) -> None:
     )
 
 
+def step_label(number: int, text: str) -> None:
+    """A small numbered step marker for multi-step forms, e.g. Ride Pricing's Trip/Conditions/Predict steps."""
+    st.markdown(
+        f'<div class="app-step-label"><span class="app-step-number">{number}</span>{text}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def section_divider(label: Optional[str] = None) -> None:
     if label:
-        st.markdown(f"##### {label}")
+        st.markdown(f'<div class="app-section-label">{label}</div>', unsafe_allow_html=True)
     else:
         st.divider()

@@ -74,6 +74,19 @@ def step_label(number: int, text: str) -> None:
     )
 
 
+def safe_page_link(path: str, label: str, icon: Optional[str] = None, use_container_width: bool = False) -> None:
+    """st.page_link(), but never lets a page-manifest issue crash the page around it.
+
+    Falls back to a plain-text hint if st.page_link() raises for any reason (observed in
+    isolated test harnesses where Streamlit's multi-page manifest isn't fully populated;
+    kept defensive here regardless of context, since a navigation link is never worth a
+    crash in the real app either)."""
+    try:
+        st.page_link(path, label=label, icon=icon, use_container_width=use_container_width)
+    except Exception:
+        st.caption(f"👉 {label} -- see the sidebar navigation.")
+
+
 def section_divider(label: Optional[str] = None) -> None:
     if label:
         st.markdown(f'<div class="app-section-label">{label}</div>', unsafe_allow_html=True)

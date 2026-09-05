@@ -22,10 +22,28 @@ from app.ui.shell import render_top_bar
 from app.ui.theme import inject_css
 
 try:
+    import httpx
     import ollama
+
     OLLAMA_AVAILABLE = True
+    # The module-level ollama.chat() convenience function talks through an internal client
+    # created with timeout=None (verified in ollama/_client.py) -- an unbounded httpx read
+    # timeout, so a slow/hung Ollama response (e.g. the model was idle and has to reload into
+    # memory) never raises, it just hangs. Streamlit's "Thinking..." spinner then spins forever
+    # with no error surfaced, which looks exactly like "the assistant stopped working" and is
+    # what typically drives a user to refresh the browser -- which starts a brand-new Streamlit
+    # session and wipes st.session_state.messages, making it look like only the first message
+    # ever worked. A real client with a bounded timeout turns that silent hang into a clean,
+    # visible error instead.
+    _ollama_client = ollama.Client(timeout=120.0)
 except ImportError:
     OLLAMA_AVAILABLE = False
+
+# How long Ollama keeps the model loaded in memory after this call. The library default is ~5
+# minutes; a short conversation with a few seconds between messages can easily exceed that,
+# forcing a slow cold reload (and, without the timeout fix above, an unbounded hang) on a later
+# message in the same chat. 30 minutes comfortably covers a normal chat session.
+OLLAMA_KEEP_ALIVE = "30m"
 
 inject_css()
 render_top_bar()
@@ -380,16 +398,30 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
 
     for _ in range(MAX_TOOL_ROUNDS):
         try:
-            response = ollama.chat(model=model_in_use, messages=messages, tools=TOOLS, stream=False)
+            response = _ollama_client.chat(
+                model=model_in_use, messages=messages, tools=TOOLS, stream=False, keep_alive=OLLAMA_KEEP_ALIVE,
+            )
         except ConnectionError:
             return "⚠️ Could not connect to Ollama. Make sure it's running with: `ollama serve`", tools_used
+        except httpx.TimeoutException:
+            return (
+                "⏱️ The AI model took too long to respond (it may still be loading into memory "
+                "after being idle). Please try sending your message again.", tools_used,
+            )
         except Exception as exc:
             if model_in_use == PRIMARY_MODEL and _is_model_missing_error(exc):
                 model_in_use = FALLBACK_MODEL
                 try:
-                    response = ollama.chat(model=model_in_use, messages=messages, tools=TOOLS, stream=False)
+                    response = _ollama_client.chat(
+                        model=model_in_use, messages=messages, tools=TOOLS, stream=False, keep_alive=OLLAMA_KEEP_ALIVE,
+                    )
                 except ConnectionError:
                     return "⚠️ Could not connect to Ollama. Make sure it's running with: `ollama serve`", tools_used
+                except httpx.TimeoutException:
+                    return (
+                        "⏱️ The AI model took too long to respond (it may still be loading into "
+                        "memory after being idle). Please try sending your message again.", tools_used,
+                    )
                 except Exception as exc2:
                     print(f"[AI Assistant] Ollama error (fallback model): {exc2}")
                     return "❌ Error: the assistant hit an unexpected problem talking to the model. Please try rephrasing your question.", tools_used
@@ -526,7 +558,9 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
     # is passed), so it cannot extend the tool-calling budget itself -- it can only read back
     # what was already gathered.
     try:
-        response = ollama.chat(model=model_in_use, messages=messages, stream=False)
+        response = _ollama_client.chat(
+            model=model_in_use, messages=messages, stream=False, keep_alive=OLLAMA_KEEP_ALIVE,
+        )
         content = response.get("message", {}).get("content")
         if content:
             return content, tools_used
@@ -542,6 +576,13 @@ def run_assistant_turn(user_message: str) -> Tuple[str, List[str]]:
 # Initialize session state for chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
+
+if st.session_state.messages:
+    _header_cols = st.columns([5, 1])
+    with _header_cols[1]:
+        if st.button("🆕 New Chat", key="ai_new_chat", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
 
 # Display chat history
 for message in st.session_state.messages:

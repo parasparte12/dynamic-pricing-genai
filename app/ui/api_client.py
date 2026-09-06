@@ -10,11 +10,15 @@ api.pricing_service / api.pricing_agent directly in-process, matching how
 the AI Assistant already does it.
 """
 
+import os
 from typing import Any, Dict
 
 import requests
 
-API_BASE = "http://127.0.0.1:8000"
+# Defaults to the local-dev value unchanged. In a multi-container deployment, set API_BASE
+# to the FastAPI service's reachable address (e.g. http://fastapi:8000 on a Docker network) --
+# "localhost" inside a container refers to that container itself, never a sibling container.
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 _TIMEOUT_SECONDS = 15
 
 

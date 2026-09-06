@@ -224,4 +224,9 @@ __marimo__/
 data/*.csv
 data/*.csv
 data/flights/*.csv
-model/*.pkl
+
+# NOT excluded: model/*.pkl. These are the trained model artifacts (~6MB total) that
+# api/pricing_service.py loads at import time. They were previously gitignored, which means
+# a fresh `git clone` has an empty model/ directory and the app fails to start. Deployment
+# (Docker or otherwise) needs these files to actually be committed -- see the deployment
+# report for the one-time step required before this repo is deployment-ready.

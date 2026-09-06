@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, Optional
 
 import requests
@@ -5,7 +6,11 @@ import requests
 from api.pricing_service import recompute_cab_price, RouteInfo, RouteRecomputeResult
 from app.route_service import get_route_for_locations, RouteError, RouteResult
 
-API_BASE = "http://127.0.0.1:8000"
+# Defaults to the local-dev value unchanged. In a multi-container deployment where this
+# module runs inside the Streamlit process/container (not the FastAPI one), set API_BASE to
+# the FastAPI service's reachable address (e.g. http://fastapi:8000 on a Docker network) --
+# "localhost" inside a container refers to that container itself, never a sibling container.
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 
 def what_if_price_change(distance, surge_multiplier, hour_of_day, day_of_week,
                           is_weekend, is_rush_hour, is_raining, cab_type_encoded,

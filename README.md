@@ -328,31 +328,35 @@ dynamic-pricing-genai/
 
 ---
 
-## ⚙️ Installation
+## ⚙️ Deployment
+
+This project supports three ways of running it, in increasing order of production-readiness. **Only the first two have actually been run and verified** — Oracle Cloud deployment is prepared for but has not been performed yet; nothing below claims otherwise.
+
+### Local Development
 
 All commands assume PowerShell, run from the `dynamic-pricing-genai/` project root.
 
-### 1. Clone the repository
+#### 1. Clone the repository
 
 ```powershell
 git clone https://github.com/parasparte12/dynamic-pricing-genai.git
 cd dynamic-pricing-genai
 ```
 
-### 2. Create and activate a virtual environment
+#### 2. Create and activate a virtual environment
 
 ```powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 ```
 
-### 3. Install dependencies
+#### 3. Install dependencies
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 4. Configure environment variables
+#### 4. Configure environment variables
 
 Copy `.env.example` to `.env` and set a PostgreSQL connection string:
 
@@ -362,7 +366,7 @@ DATABASE_URL=postgresql://username:password@host:5432/database
 
 This is optional — the app runs without it, but predictions won't be logged and Analytics will show no data.
 
-### Terminal 1 — Ollama
+#### Terminal 1 — Ollama
 
 ```powershell
 ollama serve
@@ -374,7 +378,7 @@ Pull the model the assistant needs (only required once):
 ollama pull qwen2.5:7b
 ```
 
-### Terminal 2 — Backend (FastAPI)
+#### Terminal 2 — Backend (FastAPI)
 
 ```powershell
 .\venv\Scripts\Activate.ps1
@@ -383,7 +387,7 @@ python -m uvicorn api.main:app --reload
 
 API available at `http://127.0.0.1:8000` (docs at `/docs`).
 
-### Terminal 3 — Frontend (Streamlit)
+#### Terminal 3 — Frontend (Streamlit)
 
 ```powershell
 .\venv\Scripts\Activate.ps1
@@ -393,3 +397,45 @@ python -m streamlit run app\streamlit_app.py
 > Use `python -m streamlit run ...`, **not** a bare `streamlit run ...` — Streamlit's script runner only puts `app/` on `sys.path`, not the project root that `app.route_service` and `api.pricing_service` imports need. `python -m` adds the project root itself.
 
 Open **http://localhost:8501** in your browser.
+
+### Docker (Local)
+
+Runs the full stack — Nginx, Streamlit, FastAPI, and Ollama — as separate containers on one machine. This has been built and verified locally: all endpoints, SHAP, What-if, real Nominatim/OSRM routing, and AI Assistant tool-calling all pass against the real `qwen2.5:7b` model running in its own container.
+
+```powershell
+copy .env.example .env
+# edit .env and set a real DATABASE_URL
+
+docker compose up -d
+```
+
+The first run builds the `fastapi`/`streamlit` image, pulls the official `ollama` and `nginx` images, and pulls `qwen2.5:7b` into a persistent Docker volume (`ollama_data`) — this step alone downloads ~4.7GB and only needs to happen once. Open **http://localhost** (port 80, served by Nginx) once `docker compose ps` shows `fastapi`, `streamlit`, and `ollama` as healthy.
+
+Only Nginx is published to the host (port 80). FastAPI and Ollama are reachable only from other containers on the internal Docker network, never from the host or the internet.
+
+> **Supabase note, found while testing this locally:** Supabase's direct database host resolves to an IPv6-only address, and Docker's default container networking is IPv4-only — a container cannot route to it at all. If `DATABASE_URL` points at Supabase, use the **Connection Pooler** connection string from your Supabase project's Database Settings, not the direct host. (See `.env.example` for the same note.)
+
+### Oracle Cloud (Production) — planned, not yet performed
+
+The repository is prepared for this (Dockerfile, `docker-compose.yml`, Nginx config, `.dockerignore`, `deploy/update.sh` all exist and are verified locally), but **no Oracle Cloud deployment has actually been done yet.** When it is, the steps are expected to be:
+
+1. Provision an Ubuntu VM on an Oracle Cloud Always-Free shape — an **Ampere A1 (ARM)** shape is recommended over the x86 micro shape, since `qwen2.5:7b` alone needs ~5-6GB of RAM.
+2. Install Docker Engine + the Compose plugin on the VM.
+3. `git clone` this repository onto the VM.
+4. Create `.env` on the VM from `.env.example`, using the real `DATABASE_URL` (Supabase connection pooler string — see above).
+5. Open port 80 (and later 443, for HTTPS) in the VM's security list / network security group.
+6. `docker compose up -d`, then wait for the one-time `qwen2.5:7b` pull to finish.
+
+No IP address, domain, or URL exists for this yet — none is claimed here.
+
+### Future Updates
+
+Once deployed, bringing a code change live is:
+
+```bash
+git pull
+docker compose build fastapi streamlit
+docker compose up -d --no-deps fastapi streamlit
+```
+
+(exactly what `deploy/update.sh` does, and the reasoning is the same as the architecture in this README: FastAPI and Streamlit share one image, so a code or dependency change rebuilds both; Ollama and Nginx use unmodified official images and are deliberately left untouched — verified locally by rebuilding fastapi/streamlit this way and confirming Ollama's and Nginx's container IDs, the `qwen2.5:7b` model, and the `ollama_data` volume were all completely undisturbed.)

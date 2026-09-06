@@ -1,0 +1,18 @@
+# Never send secrets or the local venv into the build context.
+.env
+.env.*
+!.env.example
+venv/
+.git/
+.gitignore
+
+# Not needed by the running app (training-only / large / dev-only).
+data/
+notebooks/
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/secrets.toml
+
+# Docs (not needed inside the image).
+*.md
